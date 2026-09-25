@@ -22,7 +22,7 @@ class BlockchainController {
     }
 
     postTransaction(req, res) {
-        this.transactions.add(req, res);
+        this.transactions.add(req, res, this.blockchain);
     }
 
     getTransactions(req, res) {

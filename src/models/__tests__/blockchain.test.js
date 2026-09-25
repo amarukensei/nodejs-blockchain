@@ -18,12 +18,22 @@ const Blockchain = require('../blockchain');
 const Block = require('../block');
 const Transaction = require('../transaction');
 const Transactions = require('../transactions');
-// A chain saved by the previous version of the app (js-sha256 and node-persist 3)
+// A chain saved by an old version of the app (node-persist 3 and unsigned transactions)
 const legacyDatum = require('./fixtures/node-persist-3-blocks.json');
 
 const GENESIS_HASH = '00002818703517bab21046d807a3fc0284b8a05979ce48baa40ed2eeeadd3b92';
 const hashOf = (algorithm, data) => crypto.createHash(algorithm).update(data).digest('hex');
 const roundTrip = (value) => JSON.parse(JSON.stringify(value));
+
+const aliceKey = crypto.generateKeyPairSync('ed25519').privateKey;
+const malloryKey = crypto.generateKeyPairSync('ed25519').privateKey;
+const alice = Transaction.address(aliceKey);
+const bob = Transaction.address(crypto.generateKeyPairSync('ed25519').privateKey);
+const mallory = Transaction.address(malloryKey);
+
+// Every transaction pays a different amount, so that none is repeated
+let lastAmount = 0;
+const newTransaction = () => Transaction.sign(aliceKey, bob, ++lastAmount);
 
 let lastPort = 0;
 const blockchains = [];
@@ -50,7 +60,7 @@ function storageDirOf(blockchain) {
 function mineBlocks(blockchain, count) {
   for (let i = 0; i < count; i++) {
     const transactions = new Transactions();
-    transactions.list.push(new Transaction('alice', 'bob', i + 1));
+    transactions.list.push(newTransaction());
     blockchain.mine(transactions, { status: jest.fn() });
   }
   return roundTrip(blockchain.blocks);
@@ -65,6 +75,10 @@ function remine(blockchain, chain, fromIdx) {
   }
   return chain;
 }
+
+afterEach(() => {
+  jest.restoreAllMocks();
+});
 
 afterAll(async () => {
   // Wait for the writes node-persist still has queued before deleting their directory
@@ -99,24 +113,33 @@ describe('Blockchain', () => {
       const reloaded = await createBlockchain(lastPort);
 
       expect(reloaded.blocks).toEqual(chain);
+      expect(reloaded.hasTransaction(chain[2].transactions[0])).toBe(true);
     });
 
     test('migrates a chain saved by node-persist 3, which named files after the MD5 of the key', async () => {
+      const chain = mineBlocks(await createBlockchain(), 2);
       const blockchain = newBlockchain();
       const dir = storageDirOf(blockchain);
-      fs.writeFileSync(path.join(dir, hashOf('md5', 'blocks')), JSON.stringify(legacyDatum));
+      fs.writeFileSync(path.join(dir, hashOf('md5', 'blocks')), JSON.stringify({ key: 'blocks', value: chain }));
 
       await blockchain.init();
 
-      expect(blockchain.blocks).toEqual(legacyDatum.value);
+      expect(blockchain.blocks).toEqual(chain);
       const migrated = JSON.parse(fs.readFileSync(path.join(dir, hashOf('sha256', 'blocks')), 'utf8'));
-      expect(migrated.value).toEqual(legacyDatum.value);
+      expect(migrated.value).toEqual(chain);
+    });
+
+    test('refuses to load a chain created before transactions were signed', async () => {
+      const blockchain = newBlockchain();
+      fs.writeFileSync(path.join(storageDirOf(blockchain), hashOf('md5', 'blocks')), JSON.stringify(legacyDatum));
+
+      await expect(blockchain.init()).rejects.toThrow('is not valid');
     });
 
     test('refuses to load a stored chain that is not valid', async () => {
-      const blockchain = newBlockchain();
-      const tampered = roundTrip(legacyDatum.value);
+      const tampered = mineBlocks(await createBlockchain(), 2);
       tampered[1].transactions[0].amount = 1000000;
+      const blockchain = newBlockchain();
       fs.writeFileSync(path.join(storageDirOf(blockchain), hashOf('sha256', 'blocks')), JSON.stringify({ key: 'blocks', value: tampered }));
 
       await expect(blockchain.init()).rejects.toThrow('is not valid');
@@ -129,7 +152,7 @@ describe('Blockchain', () => {
       const block = new Block();
       block.index = 1;
       block.previousHash = GENESIS_HASH;
-      block.transactions = [new Transaction('alice', 'bob', 5)];
+      block.transactions = [newTransaction()];
 
       const hash = blockchain.generateHash(block);
 
@@ -143,16 +166,18 @@ describe('Blockchain', () => {
     test('mines the pending transactions into a new block and broadcasts it', async () => {
       const blockchain = await createBlockchain();
       const transactions = new Transactions();
-      transactions.list.push(new Transaction('alice', 'bob', 5));
+      const tx = Transaction.sign(aliceKey, bob, 5);
+      transactions.list.push(tx);
       const mockRes = { status: jest.fn() };
 
       const block = blockchain.mine(transactions, mockRes);
 
       expect(block).toMatchObject({ index: 1, previousHash: GENESIS_HASH });
-      expect(block.transactions).toEqual([expect.objectContaining({ from: 'alice', to: 'bob', amount: 5 })]);
+      expect(block.transactions).toEqual([tx]);
       expect(transactions.list).toEqual([]);
       expect(blockchain.blocks).toHaveLength(2);
       expect(blockchain.isValidChain(roundTrip(blockchain.blocks))).toBe(true);
+      expect(blockchain.hasTransaction(roundTrip(tx))).toBe(true);
       expect(blockchain.nodes.broadcast).toHaveBeenCalledTimes(1);
       expect(mockRes.status).not.toHaveBeenCalled();
     });
@@ -168,9 +193,34 @@ describe('Blockchain', () => {
       expect(blockchain.blocks).toHaveLength(1);
       expect(blockchain.nodes.broadcast).not.toHaveBeenCalled();
     });
+
+    test('leaves out pending transactions that another node already added to the chain', async () => {
+      const peer = await createBlockchain();
+      const minedByPeer = mineBlocks(peer, 1)[1].transactions[0];
+      const blockchain = await createBlockchain();
+      blockchain.updateBlocks(roundTrip(peer.blocks));
+      const transactions = new Transactions();
+      const pending = newTransaction();
+      transactions.list.push(new Transaction(minedByPeer.from, minedByPeer.to, minedByPeer.amount, minedByPeer.timestamp, minedByPeer.signature), pending);
+
+      const block = blockchain.mine(transactions, { status: jest.fn() });
+
+      expect(block.transactions).toEqual([pending]);
+      expect(blockchain.isValidChain(roundTrip(blockchain.blocks))).toBe(true);
+    });
   });
 
-  describe('isValidChain(blocks)', () => {
+  describe('hasTransaction(tx)', () => {
+    test('tells whether the chain has the same transaction, whatever object holds it', async () => {
+      const blockchain = await createBlockchain();
+      const chain = mineBlocks(blockchain, 1);
+
+      expect(blockchain.hasTransaction({ ...chain[1].transactions[0] })).toBe(true);
+      expect(blockchain.hasTransaction(newTransaction())).toBe(false);
+    });
+  });
+
+  describe('isValidChain(blocks, knownBlocks)', () => {
     let blockchain;
     let chain;
 
@@ -183,8 +233,8 @@ describe('Blockchain', () => {
       expect(blockchain.isValidChain(chain)).toBe(true);
     });
 
-    test('accepts a chain saved by the previous version of the app', () => {
-      expect(blockchain.isValidChain(legacyDatum.value)).toBe(true);
+    test('rejects a chain created before transactions were signed', () => {
+      expect(blockchain.isValidChain(legacyDatum.value)).toBe(false);
     });
 
     test.each([
@@ -201,16 +251,22 @@ describe('Blockchain', () => {
       expect(blockchain.isValidChain(tamper(roundTrip(chain)))).toBe(false);
     });
 
-    test('rejects invalid transactions even when the proof of work is redone', () => {
+    test.each([
+      ['a transaction whose recipient was changed', (c) => { c[1].transactions[0].to = mallory; }],
+      ['a transaction from alice signed by mallory', (c) => {
+        c[3].transactions.push({ ...roundTrip(Transaction.sign(malloryKey, mallory, 1000)), from: alice });
+      }],
+      ['the same transaction twice', (c) => { c[3].transactions.push(c[1].transactions[0]); }],
+    ])('rejects %s even when the proof of work is redone', (description, tamper) => {
       const tampered = roundTrip(chain);
-      tampered[1].transactions[0].amount = -1000;
+      tamper(tampered);
 
       expect(blockchain.isValidChain(remine(blockchain, tampered, 1))).toBe(false);
     });
 
     test('rejects a genesis block with transactions even when the proof of work is redone', () => {
       const tampered = roundTrip(chain);
-      tampered[0].transactions = [roundTrip(new Transaction('mallory', 'mallory', 1000))];
+      tampered[0].transactions = [roundTrip(Transaction.sign(malloryKey, mallory, 1000))];
 
       expect(blockchain.isValidChain(remine(blockchain, tampered, 0))).toBe(false);
     });
@@ -224,6 +280,33 @@ describe('Blockchain', () => {
 
       expect(blockchain.isValidChain(tampered)).toBe(false);
     });
+
+    test('only verifies the signatures of the blocks that are not known', async () => {
+      const local = await createBlockchain();
+      const knownBlocks = mineBlocks(local, 2);
+      const longerChain = mineBlocks(local, 1);
+      const isValid = jest.spyOn(Transaction, 'isValid');
+
+      expect(local.isValidChain(longerChain, knownBlocks)).toBe(true);
+      expect(isValid).toHaveBeenCalledTimes(1);
+      expect(isValid).toHaveBeenCalledWith(longerChain[3].transactions[0]);
+
+      // Known blocks still need the right content for their hash
+      const tampered = roundTrip(longerChain);
+      tampered[1].transactions[0].amount = 1000;
+      expect(local.isValidChain(tampered, knownBlocks)).toBe(false);
+    });
+
+    test('verifies the signatures of the blocks that replace known ones', async () => {
+      const local = await createBlockchain();
+      const knownBlocks = mineBlocks(local, 2);
+      // A longer fork where mallory changed the recipient of a known transaction
+      const fork = roundTrip(knownBlocks);
+      fork[1].transactions[0].to = mallory;
+      fork.push({ index: 3, previousHash: '', hash: '', timestamp: 1, nonce: 0, transactions: [roundTrip(newTransaction())] });
+
+      expect(local.isValidChain(remine(local, fork, 1), knownBlocks)).toBe(false);
+    });
   });
 
   describe('updateBlocks(blocks)', () => {
@@ -234,6 +317,7 @@ describe('Blockchain', () => {
 
       expect(blockchain.updateBlocks(peerChain)).toBe(true);
       expect(blockchain.blocks).toEqual(peerChain);
+      expect(blockchain.hasTransaction(peerChain[1].transactions[0])).toBe(true);
 
       await blockchain.save();
       expect((await createBlockchain(port)).blocks).toEqual(peerChain);
@@ -243,11 +327,12 @@ describe('Blockchain', () => {
       const blockchain = await createBlockchain();
       const current = roundTrip(blockchain.blocks);
       const peerChain = mineBlocks(await createBlockchain(), 2);
-      peerChain[2].transactions[0].to = 'mallory';
+      peerChain[2].transactions[0].to = mallory;
 
       expect(blockchain.updateBlocks(peerChain)).toBe(false);
       expect(blockchain.updateBlocks({ length: 99 })).toBe(false);
       expect(roundTrip(blockchain.blocks)).toEqual(current);
+      expect(blockchain.hasTransaction(peerChain[1].transactions[0])).toBe(false);
     });
 
     test('keeps the current chain when the new one starts with another genesis block', async () => {

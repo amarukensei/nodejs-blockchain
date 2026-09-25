@@ -11,6 +11,8 @@ const GENESIS_PREVIOUS_HASH = '0000000000000000';
 class Blockchain {
     constructor(url, port) {
         this.blocks = [];
+        // Messages of the transactions in the chain, so that none can be added twice
+        this.transactionMessages = new Set();
         this.nodes = new Nodes(url, port);
         this.storageDir = path.join(__dirname, '../../storage', crypto.createHash('md5').update(url+port).digest("hex"));
         this.storage = nodePersist.create({
@@ -42,10 +44,12 @@ class Blockchain {
         }
 
         if (!this.isValidChain(blocks)) {
-            throw new Error('The blockchain stored in ' + this.storageDir + ' is not valid, move it away to start a new one');
+            throw new Error('The blockchain stored in ' + this.storageDir + ' is not valid (chains created before ' +
+                'transactions were signed are not valid anymore), move it away to start a new one');
         }
 
         this.blocks = blocks;
+        this.indexTransactions();
         if (migrated) {
             await this.save();
         }
@@ -65,7 +69,19 @@ class Blockchain {
         }
 
         this.blocks.push(block);
+        block.transactions.forEach(tx => this.transactionMessages.add(Transaction.message(tx)));
         this.save();
+    }
+
+    indexTransactions() {
+        this.transactionMessages = new Set();
+        this.blocks.forEach(block => {
+            block.transactions.forEach(tx => this.transactionMessages.add(Transaction.message(tx)));
+        });
+    }
+
+    hasTransaction(tx) {
+        return this.transactionMessages.has(Transaction.message(tx));
     }
 
     getNextBlock(transactions) {
@@ -104,6 +120,9 @@ class Blockchain {
     }
 
     mine(transactions, res) {
+        // Another node may have added some of them to the chain since they were received
+        transactions.list = transactions.list.filter(tx => !this.hasTransaction(tx));
+
         if (transactions.list.length == 0) {
             res.status(500);
             return {error: 'No transactions to be mined'};
@@ -116,12 +135,24 @@ class Blockchain {
         return block;
     }
 
-    // Checks a chain that comes from outside this node (another node or the disk):
-    // blocks must be well formed, properly linked and carry a valid proof of work.
-    isValidChain(blocks) {
+    // Checks a chain that comes from outside this node (another node or the disk): blocks
+    // must be well formed, properly linked and carry a valid proof of work, and transactions
+    // must be signed by their sender and appear only once. Signatures are only verified for
+    // blocks that are not in knownBlocks, as those were verified when they were added.
+    isValidChain(blocks, knownBlocks = []) {
         if (!Array.isArray(blocks) || blocks.length == 0) {
             return false;
         }
+
+        const seenMessages = new Set();
+        const isFirstSeen = tx => {
+            const message = Transaction.message(tx);
+            if (seenMessages.has(message)) {
+                return false;
+            }
+            seenMessages.add(message);
+            return true;
+        };
 
         return blocks.every((block, idx) =>
             block !== null && typeof block === 'object' &&
@@ -132,20 +163,24 @@ class Blockchain {
             Number.isSafeInteger(block.nonce) && block.nonce >= 0 &&
             Array.isArray(block.transactions) &&
             (idx > 0 || block.transactions.length == 0) &&
-            block.transactions.every(tx => Transaction.isValid(tx)) &&
             typeof block.hash === 'string' && block.hash.startsWith(DIFFICULTY) &&
-            this.calculateHash(block) === block.hash
+            this.calculateHash(block) === block.hash &&
+            // With the hash verified, a block with the same hash as a known one has the same content
+            block.transactions.every(tx =>
+                (knownBlocks[idx]?.hash === block.hash || Transaction.isValid(tx)) && isFirstSeen(tx)
+            )
         );
     }
 
     // Replaces the chain with one received from another node, as long as it is valid
     // and starts with the same genesis block. Returns whether the chain was replaced.
     updateBlocks(blocks) {
-        if (!this.isValidChain(blocks) || blocks[0].hash !== this.blocks[0].hash) {
+        if (!this.isValidChain(blocks, this.blocks) || blocks[0].hash !== this.blocks[0].hash) {
             return false;
         }
 
         this.blocks = blocks;
+        this.indexTransactions();
         this.save();
         return true;
     }

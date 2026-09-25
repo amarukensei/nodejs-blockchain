@@ -1,18 +1,23 @@
+const crypto = require('crypto');
 const Transactions = require('../transactions');
 const Transaction = require('../transaction');
 
-// Mock the Transaction class to control its behavior
-jest.mock('../transaction');
+const aliceKey = crypto.generateKeyPairSync('ed25519').privateKey;
+const bob = Transaction.address(crypto.generateKeyPairSync('ed25519').privateKey);
+
+// Body of a request with a transaction from alice to bob
+function signedBody(amount = 100) {
+  return JSON.parse(JSON.stringify(Transaction.sign(aliceKey, bob, amount)));
+}
 
 describe('Transactions', () => {
   let transactions;
   let mockReq;
   let mockRes;
+  let mockBlockchain;
 
   beforeEach(() => {
     transactions = new Transactions();
-    // Reset the mock before each test to clear previous calls and instances
-    Transaction.mockClear();
 
     mockReq = {
       body: {},
@@ -20,6 +25,9 @@ describe('Transactions', () => {
     mockRes = {
       json: jest.fn(),
       status: jest.fn().mockReturnThis(), // Ensure status can be chained (though not strictly needed here)
+    };
+    mockBlockchain = {
+      hasTransaction: jest.fn().mockReturnValue(false),
     };
   });
 
@@ -29,69 +37,90 @@ describe('Transactions', () => {
     });
   });
 
-  describe('add(req, res)', () => {
+  describe('add(req, res, blockchain)', () => {
     describe('Success case', () => {
       test('should create a new Transaction, add it to the list, and send success response', () => {
-        mockReq.body = { from: 'address1', to: 'address2', amount: 100 };
-        const mockTransactionInstance = {
-          from: 'address1',
-          to: 'address2',
-          amount: 100,
-          timestamp: Date.now(),
-        };
-        // Configure the mock Transaction constructor to return our mock instance
-        Transaction.mockImplementation(() => mockTransactionInstance);
+        mockReq.body = signedBody();
 
-        transactions.add(mockReq, mockRes);
+        transactions.add(mockReq, mockRes, mockBlockchain);
 
-        expect(Transaction).toHaveBeenCalledTimes(1);
-        expect(Transaction).toHaveBeenCalledWith('address1', 'address2', 100);
         expect(transactions.list).toHaveLength(1);
-        expect(transactions.list[0]).toBe(mockTransactionInstance);
+        expect(transactions.list[0]).toBeInstanceOf(Transaction);
+        expect(transactions.list[0]).toEqual(mockReq.body);
+        expect(mockBlockchain.hasTransaction).toHaveBeenCalledWith(transactions.list[0]);
         expect(mockRes.json).toHaveBeenCalledWith({ success: 1 });
         expect(mockRes.status).not.toHaveBeenCalled();
       });
     });
 
-    describe('Failure case (Transaction creation throws error)', () => {
+    describe('Failure case (invalid transaction)', () => {
       test('should not add to list, set status to 406, and send error response', () => {
-        mockReq.body = { from: 'address1', amount: 100 }; // Missing 'to'
-        const errorMessage = 'Transaction "to" is mandatory';
-        // Configure the mock Transaction constructor to throw an error
-        Transaction.mockImplementation(() => {
-          throw new Error(errorMessage);
-        });
+        mockReq.body = { ...signedBody(), amount: 5000 }; // Changed after signing
 
-        transactions.add(mockReq, mockRes);
+        transactions.add(mockReq, mockRes, mockBlockchain);
 
-        expect(Transaction).toHaveBeenCalledTimes(1);
-        expect(Transaction).toHaveBeenCalledWith('address1', undefined, 100);
         expect(transactions.list).toHaveLength(0);
         expect(mockRes.status).toHaveBeenCalledWith(406);
-        expect(mockRes.json).toHaveBeenCalledWith({ error: errorMessage });
+        expect(mockRes.json).toHaveBeenCalledWith({ error: 'Transaction "signature" is not valid' });
       });
 
-      test('should validate an empty transaction when the request has no JSON body', () => {
+      test('should reject requests without a JSON body', () => {
         mockReq.body = undefined; // Express 5 leaves req.body undefined without a JSON body
 
-        transactions.add(mockReq, mockRes);
+        transactions.add(mockReq, mockRes, mockBlockchain);
 
-        expect(Transaction).toHaveBeenCalledWith(undefined, undefined, undefined);
+        expect(transactions.list).toHaveLength(0);
+        expect(mockRes.status).toHaveBeenCalledWith(406);
+        expect(mockRes.json).toHaveBeenCalledWith({ error: 'Transaction "from" is mandatory' });
+      });
+    });
+
+    describe('Failure case (transaction already received)', () => {
+      test('should reject a transaction that is already pending', () => {
+        mockReq.body = signedBody();
+        transactions.add(mockReq, mockRes, mockBlockchain);
+
+        transactions.add(mockReq, mockRes, mockBlockchain);
+
+        expect(transactions.list).toHaveLength(1);
+        expect(mockRes.status).toHaveBeenCalledWith(406);
+        expect(mockRes.json).toHaveBeenLastCalledWith({ error: 'Transaction already received' });
+      });
+
+      test('should reject a transaction that is already in the blockchain', () => {
+        mockReq.body = signedBody();
+        mockBlockchain.hasTransaction.mockReturnValue(true);
+
+        transactions.add(mockReq, mockRes, mockBlockchain);
+
+        expect(transactions.list).toHaveLength(0);
+        expect(mockRes.status).toHaveBeenCalledWith(406);
+        expect(mockRes.json).toHaveBeenCalledWith({ error: 'Transaction already received' });
       });
     });
 
     describe('Failure case (too many pending transactions)', () => {
       test('should reject the transaction with status 503 once 1000 are pending', () => {
         transactions.list = new Array(1000).fill({ id: 'tx' });
-        mockReq.body = { from: 'address1', to: 'address2', amount: 100 };
+        mockReq.body = signedBody();
 
-        transactions.add(mockReq, mockRes);
+        transactions.add(mockReq, mockRes, mockBlockchain);
 
-        expect(Transaction).not.toHaveBeenCalled();
         expect(transactions.list).toHaveLength(1000);
         expect(mockRes.status).toHaveBeenCalledWith(503);
         expect(mockRes.json).toHaveBeenCalledWith({ error: 'Too many pending transactions, mine them before adding more' });
       });
+    });
+  });
+
+  describe('has(tx)', () => {
+    test('should tell whether the same transaction is pending, whatever object holds it', () => {
+      const body = signedBody();
+      mockReq.body = body;
+      transactions.add(mockReq, mockRes, mockBlockchain);
+
+      expect(transactions.has({ ...body })).toBe(true);
+      expect(transactions.has(signedBody(1))).toBe(false);
     });
   });
 

@@ -13,6 +13,7 @@ jest.mock('node-persist', () => ({
   },
 }));
 
+const crypto = require('crypto');
 const request = require('supertest');
 const { createApp } = require('../../app');
 const Blockchain = require('../../models/blockchain');
@@ -22,6 +23,14 @@ const nodesConfig = require('../../../config/nodes.json');
 
 const GENESIS_HASH = '00002818703517bab21046d807a3fc0284b8a05979ce48baa40ed2eeeadd3b92';
 
+const aliceKey = crypto.generateKeyPairSync('ed25519').privateKey;
+const alice = Transaction.address(aliceKey);
+const bob = Transaction.address(crypto.generateKeyPairSync('ed25519').privateKey);
+
+// Body of a request with a transaction signed by alice, as `node wallet sign` prints it
+let lastAmount = 0;
+const signedTransaction = (to = bob, amount = ++lastAmount) => JSON.parse(JSON.stringify(Transaction.sign(aliceKey, to, amount)));
+
 let lastPort = 0;
 
 // A chain one block longer than a new node's, as another node would send it
@@ -29,7 +38,7 @@ async function peerChain() {
   const peer = new Blockchain('peer-host', ++lastPort);
   await peer.init();
   const transactions = new Transactions();
-  transactions.list.push(new Transaction('alice', 'bob', 1));
+  transactions.list.push(Transaction.sign(aliceKey, bob, ++lastAmount));
   peer.mine(transactions, { status: jest.fn() });
   return JSON.parse(JSON.stringify(peer.blocks));
 }
@@ -61,8 +70,8 @@ describe('Blockchain API Integration Tests', () => {
   });
 
   describe('POST /transaction', () => {
-    test('Success: should add a transaction and return success', async () => {
-      const transactionData = { from: 'wallet1', to: 'wallet2', amount: 100 };
+    test('Success: should add a signed transaction and return success', async () => {
+      const transactionData = signedTransaction();
       const response = await request(app)
         .post('/transaction')
         .send(transactionData);
@@ -71,18 +80,20 @@ describe('Blockchain API Integration Tests', () => {
 
       // Verify by getting transactions
       const transactionsResponse = await request(app).get('/transactions');
-      expect(transactionsResponse.body).toHaveLength(1);
-      expect(transactionsResponse.body[0]).toMatchObject(transactionData);
+      expect(transactionsResponse.body).toEqual([transactionData]);
     });
 
     test.each([
-      [{ to: 'wallet2', amount: 100 }, 'Transaction "from" is mandatory'],
-      [{ from: { $gt: '' }, to: 'wallet2', amount: 100 }, 'Transaction "from" must be a string of up to 256 characters'],
-      [{ from: 'wallet1', to: 'wallet2', amount: -100 }, 'Transaction "amount" must be a positive number'],
-    ])('Failure (invalid data): should return 406 for %j', async (transactionData, error) => {
+      ['missing "from"', ({ from, ...tx }) => tx, 'Transaction "from" is mandatory'],
+      ['"from" is not an address', (tx) => ({ ...tx, from: { $gt: '' } }), 'Transaction "from" must be an address (a public key of 64 hexadecimal characters)'],
+      ['a negative amount', (tx) => ({ ...tx, amount: -100 }), 'Transaction "amount" must be a positive number'],
+      ['a changed amount', (tx) => ({ ...tx, amount: 1000000 }), 'Transaction "signature" is not valid'],
+      ['no signature', ({ signature, ...tx }) => tx, 'Transaction "signature" is mandatory'],
+      ['the format of old versions', () => ({ from: 'wallet1', to: 'wallet2', amount: 100 }), 'Transaction "from" must be an address (a public key of 64 hexadecimal characters)'],
+    ])('Failure (invalid data): should return 406 for %s', async (description, build, error) => {
       const response = await request(app)
         .post('/transaction')
-        .send(transactionData);
+        .send(build(signedTransaction()));
       expect(response.status).toBe(406);
       expect(response.body).toEqual({ error });
 
@@ -94,7 +105,7 @@ describe('Blockchain API Integration Tests', () => {
       const response = await request(app)
         .post('/transaction')
         .type('form')
-        .send({ from: 'wallet1', to: 'wallet2', amount: 100 });
+        .send(signedTransaction());
       expect(response.status).toBe(406);
       expect(response.body).toEqual({ error: 'Transaction "from" is mandatory' });
     });
@@ -112,9 +123,26 @@ describe('Blockchain API Integration Tests', () => {
     test('Failure (body too large): should return 413', async () => {
       const response = await request(app)
         .post('/transaction')
-        .send({ from: 'a'.repeat(20 * 1024), to: 'wallet2', amount: 1 });
+        .send({ ...signedTransaction(), from: 'a'.repeat(20 * 1024) });
       expect(response.status).toBe(413);
       expect(response.body).toEqual({ error: 'request entity too large' });
+    });
+
+    test('Failure (replay): should not accept the same transaction twice, before or after mining it', async () => {
+      const transactionData = signedTransaction();
+      await request(app).post('/transaction').send(transactionData);
+
+      let response = await request(app).post('/transaction').send(transactionData);
+      expect(response.status).toBe(406);
+      expect(response.body).toEqual({ error: 'Transaction already received' });
+
+      await request(app).get('/mine');
+      response = await request(app).post('/transaction').send(transactionData);
+      expect(response.status).toBe(406);
+      expect(response.body).toEqual({ error: 'Transaction already received' });
+
+      const blockchainResponse = await request(app).get('/blockchain');
+      expect(blockchainResponse.body[1].transactions).toEqual([transactionData]);
     });
   });
 
@@ -128,15 +156,14 @@ describe('Blockchain API Integration Tests', () => {
 
   describe('GET /mine', () => {
     test('With pending transactions: should mine a block, return it and notify the other nodes', async () => {
-      const tx1 = { from: 'minerWallet', to: 'recipient1', amount: 10 };
+      const tx1 = signedTransaction();
       await request(app).post('/transaction').send(tx1);
 
       const mineResponse = await request(app).get('/mine');
       expect(mineResponse.status).toBe(200);
       expect(mineResponse.body).toMatchObject({ index: 1, previousHash: GENESIS_HASH });
       expect(mineResponse.body.hash).toMatch(/^000[0-9a-f]{61}$/);
-      expect(mineResponse.body.transactions).toHaveLength(1);
-      expect(mineResponse.body.transactions[0]).toMatchObject(tx1);
+      expect(mineResponse.body.transactions).toEqual([tx1]);
 
       // Verify transactions are cleared
       const transactionsResponse = await request(app).get('/transactions');
@@ -170,7 +197,8 @@ describe('Blockchain API Integration Tests', () => {
 
   describe('GET /blockchain/:idx', () => {
     test('Valid index: should return the correct block', async () => {
-      await request(app).post('/transaction').send({ from: 'idxTest', to: 'receiver', amount: 1 });
+      const tx = signedTransaction();
+      await request(app).post('/transaction').send(tx);
       await request(app).get('/mine');
 
       let response = await request(app).get('/blockchain/0');
@@ -180,7 +208,7 @@ describe('Blockchain API Integration Tests', () => {
       response = await request(app).get('/blockchain/1');
       expect(response.status).toBe(200);
       expect(response.body.index).toBe(1);
-      expect(response.body.transactions[0].from).toBe('idxTest');
+      expect(response.body.transactions).toEqual([tx]);
     });
 
     test.each(['999', 'abc'])('Invalid index (%s): should return 200 and empty array', async (idx) => {
@@ -196,7 +224,7 @@ describe('Blockchain API Integration Tests', () => {
       expect(response.status).toBe(200);
       expect(response.body).toBe(0);
 
-      await request(app).post('/transaction').send({ from: 'wallet1', to: 'wallet2', amount: 1 });
+      await request(app).post('/transaction').send(signedTransaction());
       await request(app).get('/mine');
 
       response = await request(app).get('/blockchain/last-index');
