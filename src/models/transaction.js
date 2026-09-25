@@ -1,23 +1,12 @@
-const crypto = require('crypto');
-
-// Addresses are Ed25519 public keys and signatures are Ed25519 signatures, both hex encoded
-const ADDRESS_FORMAT = /^[0-9a-f]{64}$/;
-const SIGNATURE_FORMAT = /^[0-9a-f]{128}$/;
+const keys = require('./keys');
 
 function validateAddress(name, address) {
     if (!address) {
         throw new Error('Transaction "' + name + '" is mandatory');
     }
-    if (!Transaction.isAddress(address)) {
+    if (!keys.isAddress(address)) {
         throw new Error('Transaction "' + name + '" must be an address (a public key of 64 hexadecimal characters)');
     }
-}
-
-function publicKeyOf(address) {
-    return crypto.createPublicKey({
-        key: {kty: 'OKP', crv: 'Ed25519', x: Buffer.from(address, 'hex').toString('base64url')},
-        format: 'jwk'
-    });
 }
 
 class Transaction {
@@ -33,20 +22,19 @@ class Transaction {
 
     // Creates a transaction from the owner of privateKey, signed with it
     static sign(privateKey, to, amount, timestamp = Math.floor(+new Date() / 1000)) {
-        const from = Transaction.address(privateKey);
-        const signature = crypto.sign(null, Buffer.from(Transaction.message({from, to, amount, timestamp})), privateKey);
+        const from = keys.addressOf(privateKey);
+        const signature = keys.sign(privateKey, Transaction.message({from, to, amount, timestamp}));
 
-        return new Transaction(from, to, amount, timestamp, signature.toString('hex'));
+        return new Transaction(from, to, amount, timestamp, signature);
     }
 
     static isAddress(address) {
-        return typeof address === 'string' && ADDRESS_FORMAT.test(address);
+        return keys.isAddress(address);
     }
 
     // Address of a key pair, given its private or its public key (as KeyObjects)
     static address(key) {
-        const publicKey = key.type == 'private' ? crypto.createPublicKey(key) : key;
-        return Buffer.from(publicKey.export({format: 'jwk'}).x, 'base64url').toString('hex');
+        return keys.addressOf(key);
     }
 
     // What the sender signs: every field but the signature, in this order
@@ -70,10 +58,7 @@ class Transaction {
         if (!signature) {
             throw new Error('Transaction "signature" is mandatory');
         }
-
-        const message = Buffer.from(Transaction.message({from, to, amount, timestamp}));
-        if (typeof signature !== 'string' || !SIGNATURE_FORMAT.test(signature) ||
-            !crypto.verify(null, message, publicKeyOf(from), Buffer.from(signature, 'hex'))) {
+        if (!keys.verify(from, Transaction.message({from, to, amount, timestamp}), signature)) {
             throw new Error('Transaction "signature" is not valid');
         }
     }
