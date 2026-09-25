@@ -1,10 +1,12 @@
-# Publishes a GitHub release when a version tag (v1.2.3) is pushed, with the notes of that
-# version in CHANGELOG.md, once the tests and the audit of the dependencies pass.
+# Publishes the GitHub release of the version in package.json, with its notes in CHANGELOG.md,
+# once the tests and the audit of the dependencies pass. It runs when a version tag (v1.2.3) is
+# pushed, or by hand from the Actions tab, which creates the tag on the chosen branch.
 name: Release
 
 on:
   push:
     tags: ['v*']
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -12,8 +14,6 @@ permissions:
 jobs:
   release:
     runs-on: ubuntu-latest
-    env:
-      TAG: ${{ github.ref_name }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -22,8 +22,14 @@ jobs:
         with:
           node-version: 22
           cache: npm
-      - name: Check that the tag is the version in package.json
-        run: test "$TAG" = "v$(node -p "require('./package.json').version")"
+      - name: Get the version to release
+        run: |
+          TAG="v$(node -p "require('./package.json').version")"
+          if [ "$GITHUB_EVENT_NAME" = push ] && [ "$GITHUB_REF_NAME" != "$TAG" ]; then
+            echo "The tag $GITHUB_REF_NAME is not the version in package.json ($TAG)"
+            exit 1
+          fi
+          echo "TAG=$TAG" >> "$GITHUB_ENV"
       - run: npm ci
       - run: npm test
       - run: npm audit --audit-level=high
@@ -32,4 +38,4 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           node .github/scripts/release-notes.js "$TAG" > notes.md
-          gh release create "$TAG" --title "$TAG" --notes-file notes.md --verify-tag
+          gh release create "$TAG" --title "$TAG" --notes-file notes.md --target "$GITHUB_SHA"
