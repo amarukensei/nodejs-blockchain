@@ -25,14 +25,24 @@ describe('Transaction', () => {
     });
   });
 
+  describe('isAddress', () => {
+    test('accepts public keys in lowercase hexadecimal', () => {
+      expect(Transaction.isAddress(alice)).toBe(true);
+    });
+
+    test.each([undefined, null, 12345, 'alice', 'A'.repeat(64), 'a'.repeat(63), 'a'.repeat(65)])('rejects %p', (address) => {
+      expect(Transaction.isAddress(address)).toBe(false);
+    });
+  });
+
   describe('sign', () => {
     test('creates a transaction from the owner of the key, signed with it', () => {
-      const transaction = Transaction.sign(aliceKey, bob, 2.5, 1790000000);
+      const transaction = Transaction.sign(aliceKey, bob, 25, 1790000000);
 
       expect(transaction).toBeInstanceOf(Transaction);
-      expect(transaction).toMatchObject({ from: alice, to: bob, amount: 2.5, timestamp: 1790000000 });
+      expect(transaction).toMatchObject({ from: alice, to: bob, amount: 25, timestamp: 1790000000 });
       expect(transaction.signature).toMatch(/^[0-9a-f]{128}$/);
-      const message = Buffer.from(JSON.stringify({ from: alice, to: bob, amount: 2.5, timestamp: 1790000000 }));
+      const message = Buffer.from(JSON.stringify({ from: alice, to: bob, amount: 25, timestamp: 1790000000 }));
       expect(crypto.verify(null, message, crypto.createPublicKey(aliceKey), Buffer.from(transaction.signature, 'hex'))).toBe(true);
     });
 
@@ -81,8 +91,8 @@ describe('Transaction', () => {
       expect(() => create({ ...signedFields(), amount: 'not-a-number' })).toThrow('Transaction "amount" is mandatory and must be a number');
     });
 
-    test.each([0, -5, Infinity, -Infinity])('should throw an error if "amount" is %p', (amount) => {
-      expect(() => create({ ...signedFields(), amount })).toThrow('Transaction "amount" must be a positive number');
+    test.each([0, -5, 2.5, 2 ** 53, Infinity, -Infinity])('should throw an error if "amount" is %p', (amount) => {
+      expect(() => create({ ...signedFields(), amount })).toThrow('Transaction "amount" must be a positive integer');
     });
 
     test.each([undefined, 'now', 1.5, -1])('should throw an error if "timestamp" is %p', (timestamp) => {
@@ -112,8 +122,8 @@ describe('Transaction', () => {
 
   describe('message', () => {
     test('is the JSON of every field but the signature', () => {
-      const fields = signedFields(2.5, 1790000000);
-      expect(Transaction.message(fields)).toBe(`{"from":"${alice}","to":"${bob}","amount":2.5,"timestamp":1790000000}`);
+      const fields = signedFields(25, 1790000000);
+      expect(Transaction.message(fields)).toBe(`{"from":"${alice}","to":"${bob}","amount":25,"timestamp":1790000000}`);
     });
   });
 

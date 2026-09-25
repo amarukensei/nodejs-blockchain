@@ -8,7 +8,7 @@ function validateAddress(name, address) {
     if (!address) {
         throw new Error('Transaction "' + name + '" is mandatory');
     }
-    if (typeof address !== 'string' || !ADDRESS_FORMAT.test(address)) {
+    if (!Transaction.isAddress(address)) {
         throw new Error('Transaction "' + name + '" must be an address (a public key of 64 hexadecimal characters)');
     }
 }
@@ -39,6 +39,10 @@ class Transaction {
         return new Transaction(from, to, amount, timestamp, signature.toString('hex'));
     }
 
+    static isAddress(address) {
+        return typeof address === 'string' && ADDRESS_FORMAT.test(address);
+    }
+
     // Address of a key pair, given its private or its public key (as KeyObjects)
     static address(key) {
         const publicKey = key.type == 'private' ? crypto.createPublicKey(key) : key;
@@ -56,8 +60,9 @@ class Transaction {
         if (amount === undefined || typeof amount !== 'number' || isNaN(amount)) {
             throw new Error('Transaction "amount" is mandatory and must be a number');
         }
-        if (amount <= 0 || !Number.isFinite(amount)) {
-            throw new Error('Transaction "amount" must be a positive number');
+        // Whole units only, so that balances add up exactly
+        if (amount <= 0 || !Number.isSafeInteger(amount)) {
+            throw new Error('Transaction "amount" must be a positive integer');
         }
         if (!Number.isSafeInteger(timestamp) || timestamp < 0) {
             throw new Error('Transaction "timestamp" is mandatory and must be a Unix time in seconds');

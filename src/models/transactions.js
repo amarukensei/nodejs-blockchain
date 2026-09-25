@@ -23,6 +23,10 @@ class Transactions {
             if (this.has(tx) || blockchain.hasTransaction(tx)) {
                 throw new Error('Transaction already received');
             }
+            // What the sender has, minus what its pending transactions already spend
+            if (blockchain.balanceOf(tx.from) - this.pendingAmount(tx.from) < tx.amount) {
+                throw new Error('Insufficient balance');
+            }
             this.list.push(tx);
             response = {'success': 1};
 
@@ -37,6 +41,10 @@ class Transactions {
     has(tx) {
         const message = Transaction.message(tx);
         return this.list.some(pending => Transaction.message(pending) == message);
+    }
+
+    pendingAmount(address) {
+        return this.list.filter(pending => pending.from == address).reduce((total, pending) => total + pending.amount, 0);
     }
 
     get() {

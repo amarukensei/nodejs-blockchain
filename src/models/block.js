@@ -5,6 +5,7 @@ class Block {
         this.hash = '';
         this.timestamp = Math.floor(+new Date() / 1000);
         this.nonce = 0;
+        this.miner = null;
         this.transactions = [];
     }
 
@@ -12,10 +13,11 @@ class Block {
         return Block.keyPrefix(this) + this.nonce;
     }
 
-    // Everything the hash of a block covers except the nonce. Static so it also works
-    // with plain objects, like blocks read from disk or received from other nodes.
+    // Everything the hash of a block covers except the nonce. It is a JSON array so that
+    // no two different blocks give the same text. Static so it also works with plain
+    // objects, like blocks read from disk or received from other nodes.
     static keyPrefix(block) {
-        return JSON.stringify(block.transactions) + block.index + block.previousHash;
+        return JSON.stringify([block.index, block.previousHash, block.timestamp, block.miner, block.transactions]);
     }
 
     addTransactions(transactions) {

@@ -1,11 +1,21 @@
+const fs = require('fs');
+const http = require('http');
+const https = require('https');
 const express = require('express');
 const helmet = require('helmet');
 const { rateLimit } = require('express-rate-limit');
 const blockchainController = require('./controllers/blockchain');
+const Transaction = require('./models/transaction');
 
 // Builds the Express app of a node once its blockchain has been loaded.
 async function createApp(url, port) {
-    let controller = new blockchainController(url, port);
+    // Where the rewards for mining go. Without it the node doesn't mine
+    const minerAddress = process.env.MINER_ADDRESS || null;
+    if (minerAddress && !Transaction.isAddress(minerAddress)) {
+        throw new Error('MINER_ADDRESS must be an address (a public key of 64 hexadecimal characters)');
+    }
+
+    let controller = new blockchainController(url, port, minerAddress);
     await controller.init();
 
     // Init express
@@ -33,6 +43,7 @@ async function createApp(url, port) {
     app.get('/blockchain/last-index', controller.getBlockLastIndex.bind(controller));
     app.get('/blockchain/:idx', controller.getBlockByIndex.bind(controller));
     app.get('/blockchain', controller.getBlockchain.bind(controller));
+    app.get('/balance/:address', controller.getBalance.bind(controller));
 
     app.use(function(req, res) {
         res.status(404).json({error: 'Not found'});
@@ -49,16 +60,22 @@ async function createApp(url, port) {
     return app;
 }
 
-// Creates a node and starts listening on url:port. Resolves with the HTTP server.
+// Creates a node and starts listening on url:port, with HTTPS if TLS_CERT and TLS_KEY give
+// the files of its certificate and private key. Resolves with the server.
 async function startServer(url, port) {
+    const { TLS_CERT, TLS_KEY } = process.env;
+    if (!TLS_CERT != !TLS_KEY) {
+        throw new Error('Set both TLS_CERT and TLS_KEY to use HTTPS');
+    }
+    const tls = TLS_CERT && {cert: fs.readFileSync(TLS_CERT), key: fs.readFileSync(TLS_KEY)};
+
     const app = await createApp(url, port);
+    const server = tls ? https.createServer(tls, app) : http.createServer(app);
 
     return new Promise(function(resolve, reject) {
-        let listener = app.listen(port, url, function(error) {
-            if (error)
-                reject(error);
-            else
-                resolve(listener);
+        server.once('error', reject);
+        server.listen(port, url, function() {
+            resolve(server);
         });
     });
 }

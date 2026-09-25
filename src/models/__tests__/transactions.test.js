@@ -28,6 +28,7 @@ describe('Transactions', () => {
     };
     mockBlockchain = {
       hasTransaction: jest.fn().mockReturnValue(false),
+      balanceOf: jest.fn().mockReturnValue(1000), // Balance of alice
     };
   });
 
@@ -48,6 +49,7 @@ describe('Transactions', () => {
         expect(transactions.list[0]).toBeInstanceOf(Transaction);
         expect(transactions.list[0]).toEqual(mockReq.body);
         expect(mockBlockchain.hasTransaction).toHaveBeenCalledWith(transactions.list[0]);
+        expect(mockBlockchain.balanceOf).toHaveBeenCalledWith(transactions.list[0].from);
         expect(mockRes.json).toHaveBeenCalledWith({ success: 1 });
         expect(mockRes.status).not.toHaveBeenCalled();
       });
@@ -99,6 +101,33 @@ describe('Transactions', () => {
       });
     });
 
+    describe('Failure case (insufficient balance)', () => {
+      test('should reject a transaction its sender cannot afford', () => {
+        mockBlockchain.balanceOf.mockReturnValue(99);
+        mockReq.body = signedBody(100);
+
+        transactions.add(mockReq, mockRes, mockBlockchain);
+
+        expect(transactions.list).toHaveLength(0);
+        expect(mockRes.status).toHaveBeenCalledWith(406);
+        expect(mockRes.json).toHaveBeenCalledWith({ error: 'Insufficient balance' });
+      });
+
+      test('should take into account what the pending transactions of the sender already spend', () => {
+        mockBlockchain.balanceOf.mockReturnValue(150);
+        mockReq.body = signedBody(100);
+        transactions.add(mockReq, mockRes, mockBlockchain);
+        mockReq.body = signedBody(50);
+        transactions.add(mockReq, mockRes, mockBlockchain);
+
+        mockReq.body = signedBody(1);
+        transactions.add(mockReq, mockRes, mockBlockchain);
+
+        expect(transactions.list.map((tx) => tx.amount)).toEqual([100, 50]);
+        expect(mockRes.json).toHaveBeenLastCalledWith({ error: 'Insufficient balance' });
+      });
+    });
+
     describe('Failure case (too many pending transactions)', () => {
       test('should reject the transaction with status 503 once 1000 are pending', () => {
         transactions.list = new Array(1000).fill({ id: 'tx' });
@@ -121,6 +150,15 @@ describe('Transactions', () => {
 
       expect(transactions.has({ ...body })).toBe(true);
       expect(transactions.has(signedBody(1))).toBe(false);
+    });
+  });
+
+  describe('pendingAmount(address)', () => {
+    test('should add up the amounts that an address sends in pending transactions', () => {
+      transactions.list = [{ from: 'alice', amount: 10 }, { from: 'bob', amount: 5 }, { from: 'alice', amount: 7 }];
+
+      expect(transactions.pendingAmount('alice')).toBe(17);
+      expect(transactions.pendingAmount('carol')).toBe(0);
     });
   });
 
