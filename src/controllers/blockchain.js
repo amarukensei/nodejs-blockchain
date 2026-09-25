@@ -1,13 +1,11 @@
 const Transaction = require('../models/transaction');
-const Transactions = require('../models/transactions');
 const Blockchain = require('../models/blockchain');
-const Nodes = require('../models/nodes');
 
 class BlockchainController {
-    constructor(url, port, minerAddress) {
-        this.blockchain = new Blockchain(url, port, minerAddress);
-        this.nodes = new Nodes(url, port);
-        this.transactions = new Transactions();
+    constructor(url, port, options) {
+        this.blockchain = new Blockchain(url, port, options);
+        this.nodes = this.blockchain.nodes;
+        this.transactions = this.blockchain.transactions;
     }
 
     init() {
@@ -23,19 +21,29 @@ class BlockchainController {
     }
 
     postTransaction(req, res) {
-        this.transactions.add(req, res, this.blockchain);
+        const tx = this.transactions.add(req, res, this.blockchain);
+        // So that any node can mine it
+        if (tx) {
+            this.nodes.shareTransaction(tx);
+        }
     }
 
     getTransactions(req, res) {
         res.json(this.transactions.get());
     }
 
-    mine(req, res) {
-        res.json(this.blockchain.mine(this.transactions, res));
-    }
-
+    // The whole chain, or only its blocks from index `from` on
     getBlockchain(req, res) {
-        res.json(this.blockchain.blocks);
+        const from = req.query.from;
+        if (from === undefined) {
+            return res.json(this.blockchain.blocks);
+        }
+        if (typeof from !== 'string' || !/^\d+$/.test(from)) {
+            res.status(400);
+            return res.json({error: '"from" must be the index of a block'});
+        }
+
+        res.json(this.blockchain.blocks.slice(Number(from)));
     }
 
     getBlockByIndex(req, res) {

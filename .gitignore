@@ -1,4 +1,5 @@
 node_modules
 nodes.prod.json
+miners.prod.json
 storage
 *.pem

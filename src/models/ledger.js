@@ -43,6 +43,18 @@ class Ledger {
             this.balances.set(miner, this.balanceOf(miner) + MINING_REWARD);
         }
     }
+
+    // Undoes the transactions and the reward of a block, when another chain replaces it
+    removeBlock(block) {
+        if (block.miner) {
+            this.balances.set(block.miner, this.balanceOf(block.miner) - MINING_REWARD);
+        }
+        for (const tx of block.transactions) {
+            this.messages.delete(Transaction.message(tx));
+            this.balances.set(tx.from, this.balanceOf(tx.from) + tx.amount);
+            this.balances.set(tx.to, this.balanceOf(tx.to) - tx.amount);
+        }
+    }
 }
 
 Ledger.MINING_REWARD = MINING_REWARD;

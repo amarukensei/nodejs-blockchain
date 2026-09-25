@@ -3,6 +3,7 @@ const fs = require('fs');
 const readline = require('readline');
 const { Writable } = require('stream');
 const { parseArgs } = require('util');
+const keys = require('./src/models/keys');
 const Transaction = require('./src/models/transaction');
 
 const usage = `Usage:
@@ -53,23 +54,13 @@ async function createWallet(file) {
 
 async function loadPrivateKey(file) {
     const pem = fs.readFileSync(file, 'utf8');
-    let privateKey;
+    const password = keys.isEncrypted(pem) ? await askPassword('Password of ' + file + ': ') : undefined;
 
-    if (pem.includes('ENCRYPTED PRIVATE KEY')) {
-        const passphrase = await askPassword('Password of ' + file + ': ');
-        try {
-            privateKey = crypto.createPrivateKey({ key: pem, passphrase });
-        } catch (error) {
-            throw new Error('Wrong password for ' + file);
-        }
-    } else {
-        privateKey = crypto.createPrivateKey(pem);
+    try {
+        return keys.readPrivateKey(pem, password);
+    } catch (error) {
+        throw new Error(error.message == 'Wrong password' ? 'Wrong password for ' + file : file + ' does not contain an Ed25519 private key');
     }
-
-    if (privateKey.asymmetricKeyType != 'ed25519') {
-        throw new Error(file + ' does not contain an Ed25519 private key');
-    }
-    return privateKey;
 }
 
 async function main() {

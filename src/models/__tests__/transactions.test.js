@@ -10,6 +10,14 @@ function signedBody(amount = 100) {
   return JSON.parse(JSON.stringify(Transaction.sign(aliceKey, bob, amount)));
 }
 
+// A node-persist storage with the given pending transactions saved
+function mockStorage(saved) {
+  return {
+    getItem: jest.fn().mockResolvedValue(saved),
+    setItem: jest.fn().mockResolvedValue(undefined),
+  };
+}
+
 describe('Transactions', () => {
   let transactions;
   let mockReq;
@@ -33,8 +41,9 @@ describe('Transactions', () => {
   });
 
   describe('constructor', () => {
-    test('should initialize an empty list of transactions', () => {
+    test('should initialize an empty list of transactions, not saved anywhere yet', () => {
       expect(transactions.list).toEqual([]);
+      expect(transactions.storage).toBeNull();
     });
   });
 
@@ -43,15 +52,26 @@ describe('Transactions', () => {
       test('should create a new Transaction, add it to the list, and send success response', () => {
         mockReq.body = signedBody();
 
-        transactions.add(mockReq, mockRes, mockBlockchain);
+        const tx = transactions.add(mockReq, mockRes, mockBlockchain);
 
-        expect(transactions.list).toHaveLength(1);
-        expect(transactions.list[0]).toBeInstanceOf(Transaction);
-        expect(transactions.list[0]).toEqual(mockReq.body);
-        expect(mockBlockchain.hasTransaction).toHaveBeenCalledWith(transactions.list[0]);
-        expect(mockBlockchain.balanceOf).toHaveBeenCalledWith(transactions.list[0].from);
+        expect(transactions.list).toEqual([tx]);
+        expect(tx).toBeInstanceOf(Transaction);
+        expect(tx).toEqual(mockReq.body);
+        expect(mockBlockchain.hasTransaction).toHaveBeenCalledWith(tx);
+        expect(mockBlockchain.balanceOf).toHaveBeenCalledWith(tx.from);
         expect(mockRes.json).toHaveBeenCalledWith({ success: 1 });
         expect(mockRes.status).not.toHaveBeenCalled();
+      });
+
+      test('should save the pending transactions', async () => {
+        const storage = mockStorage();
+        transactions.storage = storage;
+        mockReq.body = signedBody();
+
+        transactions.add(mockReq, mockRes, mockBlockchain);
+
+        await transactions.lastSave;
+        expect(storage.setItem).toHaveBeenCalledWith('transactions', transactions.list);
       });
     });
 
@@ -59,7 +79,7 @@ describe('Transactions', () => {
       test('should not add to list, set status to 406, and send error response', () => {
         mockReq.body = { ...signedBody(), amount: 5000 }; // Changed after signing
 
-        transactions.add(mockReq, mockRes, mockBlockchain);
+        expect(transactions.add(mockReq, mockRes, mockBlockchain)).toBeUndefined();
 
         expect(transactions.list).toHaveLength(0);
         expect(mockRes.status).toHaveBeenCalledWith(406);
@@ -133,11 +153,11 @@ describe('Transactions', () => {
         transactions.list = new Array(1000).fill({ id: 'tx' });
         mockReq.body = signedBody();
 
-        transactions.add(mockReq, mockRes, mockBlockchain);
+        expect(transactions.add(mockReq, mockRes, mockBlockchain)).toBeUndefined();
 
         expect(transactions.list).toHaveLength(1000);
         expect(mockRes.status).toHaveBeenCalledWith(503);
-        expect(mockRes.json).toHaveBeenCalledWith({ error: 'Too many pending transactions, mine them before adding more' });
+        expect(mockRes.json).toHaveBeenCalledWith({ error: 'Too many pending transactions, try again later' });
       });
     });
   });
@@ -178,16 +198,148 @@ describe('Transactions', () => {
     });
   });
 
-  describe('reset()', () => {
-    test('should clear the list of transactions', () => {
-      transactions.list = [{ id: 'tx1' }, { id: 'tx2' }]; // Add some dummy transactions
-      transactions.reset();
-      expect(transactions.list).toEqual([]);
+  describe('load(storage, blockchain)', () => {
+    test('should restore the saved transactions that are still valid, and keep saving to the storage', async () => {
+      const valid = signedBody(10);
+      const mined = signedBody(20);
+      const tampered = { ...signedBody(30), amount: 31 };
+      mockBlockchain.hasTransaction.mockImplementation((tx) => tx.amount == 20);
+      const storage = mockStorage([valid, mined, tampered]);
+
+      await transactions.load(storage, mockBlockchain);
+
+      expect(storage.getItem).toHaveBeenCalledWith('transactions');
+      expect(transactions.storage).toBe(storage);
+      expect(transactions.list).toEqual([valid]);
+      expect(transactions.list[0]).toBeInstanceOf(Transaction);
+      expect(storage.setItem).toHaveBeenLastCalledWith('transactions', [valid]);
     });
 
-    test('should not throw an error if the list is already empty', () => {
-      expect(() => transactions.reset()).not.toThrow();
+    test('should start with no transactions when none were saved or the saved data is not a list', async () => {
+      await transactions.load(mockStorage(undefined), mockBlockchain);
       expect(transactions.list).toEqual([]);
+
+      await transactions.load(mockStorage({ from: 'x' }), mockBlockchain);
+      expect(transactions.list).toEqual([]);
+    });
+  });
+
+  describe('save()', () => {
+    test('should do nothing until there is a storage', async () => {
+      await expect(transactions.save()).resolves.toBeUndefined();
+    });
+
+    test('should write once the previous save has finished, the list as it is then', async () => {
+      const finishWrites = [];
+      const storage = mockStorage();
+      storage.setItem.mockImplementation(() => new Promise((resolve) => finishWrites.push(resolve)));
+      transactions.storage = storage;
+      const nextTask = () => new Promise((resolve) => setImmediate(resolve));
+
+      transactions.list = [{ amount: 1 }];
+      const first = transactions.save();
+      await nextTask();
+      transactions.list = [{ amount: 1 }, { amount: 2 }];
+      const second = transactions.save();
+      await nextTask();
+
+      expect(storage.setItem).toHaveBeenCalledTimes(1);
+      expect(storage.setItem).toHaveBeenCalledWith('transactions', [{ amount: 1 }]);
+      finishWrites[0]();
+      await first;
+      await nextTask();
+      expect(storage.setItem).toHaveBeenCalledTimes(2);
+      expect(storage.setItem).toHaveBeenLastCalledWith('transactions', [{ amount: 1 }, { amount: 2 }]);
+      finishWrites[1]();
+      await second;
+    });
+
+    test('should log the failures to save instead of throwing', async () => {
+      const error = new Error('disk full');
+      const storage = mockStorage();
+      storage.setItem.mockRejectedValue(error);
+      transactions.storage = storage;
+      const consoleError = jest.spyOn(console, 'error').mockImplementation(() => {});
+
+      try {
+        await expect(transactions.save()).resolves.toBeUndefined();
+        expect(consoleError).toHaveBeenCalledWith('Failed to save the pending transactions:', error);
+      } finally {
+        consoleError.mockRestore();
+      }
+    });
+  });
+
+  describe('restore(transactions, blockchain)', () => {
+    test('should add back the transactions that are still valid, in their order', async () => {
+      transactions.storage = mockStorage();
+      const pending = signedBody(1);
+      transactions.list = [new Transaction(pending.from, pending.to, pending.amount, pending.timestamp, pending.signature)];
+      mockBlockchain.balanceOf.mockReturnValue(10);
+      const first = signedBody(2);
+      const second = signedBody(3);
+
+      transactions.restore([first, pending, signedBody(100), { ...signedBody(4), to: 'mallory' }, null, second], mockBlockchain);
+
+      // The one already pending, the one alice can't afford and the ones that are not valid are left out
+      expect(transactions.list.map((tx) => tx.amount)).toEqual([1, 2, 3]);
+      expect(transactions.list[1]).toEqual(first);
+      await transactions.lastSave;
+      expect(transactions.storage.setItem).toHaveBeenCalledTimes(1);
+    });
+
+    test('should not save when it adds nothing', async () => {
+      transactions.storage = mockStorage();
+      mockBlockchain.hasTransaction.mockReturnValue(true);
+
+      transactions.restore([signedBody()], mockBlockchain);
+
+      expect(transactions.list).toEqual([]);
+      await transactions.lastSave;
+      expect(transactions.storage.setItem).not.toHaveBeenCalled();
+    });
+
+    test('should not go over 1000 pending transactions', () => {
+      transactions.list = new Array(999).fill({ from: 'someone', amount: 1 });
+
+      transactions.restore([signedBody(1), signedBody(2)], mockBlockchain);
+
+      expect(transactions.list).toHaveLength(1000);
+      expect(transactions.list[999].amount).toBe(1);
+    });
+  });
+
+  describe('select(keep)', () => {
+    test('should leave only the transactions to keep, and return a copy of them', async () => {
+      transactions.storage = mockStorage();
+      transactions.list = [{ amount: 1 }, { amount: 2 }, { amount: 3 }];
+
+      const selected = transactions.select((tx) => tx.amount != 2);
+      selected.push({ amount: 4 });
+
+      expect(transactions.list).toEqual([{ amount: 1 }, { amount: 3 }]);
+      await transactions.lastSave;
+      expect(transactions.storage.setItem).toHaveBeenCalledWith('transactions', transactions.list);
+    });
+
+    test('should not save when it keeps them all', async () => {
+      transactions.storage = mockStorage();
+      transactions.list = [{ amount: 1 }];
+
+      expect(transactions.select(() => true)).toEqual([{ amount: 1 }]);
+      await transactions.lastSave;
+      expect(transactions.storage.setItem).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('prune(blockchain)', () => {
+    test('should remove the transactions that the chain already has', () => {
+      transactions.list = [{ amount: 1 }, { amount: 2 }];
+      mockBlockchain.hasTransaction.mockImplementation((tx) => tx.amount == 1);
+
+      transactions.prune(mockBlockchain);
+
+      expect(transactions.list).toEqual([{ amount: 2 }]);
     });
   });
 });

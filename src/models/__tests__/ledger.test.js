@@ -83,4 +83,30 @@ describe('Ledger', () => {
       expect(ledger.has(tx)).toBe(false);
     });
   });
+
+  describe('removeBlock(block)', () => {
+    test('undoes the transactions and the reward of a block', () => {
+      ledger.reward(alice);
+      const earlier = Transaction.sign(aliceKey, bob, 5);
+      ledger.add(earlier);
+      const tx = Transaction.sign(aliceKey, bob, 20);
+      ledger.add(tx);
+      ledger.reward(bob);
+
+      ledger.removeBlock({ miner: bob, transactions: [tx] });
+
+      expect(ledger.balanceOf(alice)).toBe(45);
+      expect(ledger.balanceOf(bob)).toBe(5);
+      expect(ledger.has(tx)).toBe(false);
+      expect(ledger.has(earlier)).toBe(true);
+      // So the transaction can go in another block
+      expect(ledger.add(tx)).toBe(true);
+    });
+
+    test('has no reward to undo without a miner', () => {
+      ledger.reward(alice);
+      ledger.removeBlock({ miner: null, transactions: [] });
+      expect(ledger.balanceOf(alice)).toBe(50);
+    });
+  });
 });

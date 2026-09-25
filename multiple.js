@@ -11,6 +11,15 @@ nodes.forEach( node => {
     startServer(url, port)
         .then(function(listener) {
             console.log('Server started at ' + listener.address().address + ':' + listener.address().port);
+
+            // Ctrl+C stops mining and the servers, and the nodes end once they have saved their chains.
+            // A second Ctrl+C ends them at once.
+            for (const signal of ['SIGINT', 'SIGTERM']) {
+                process.once(signal, function() {
+                    console.log('Stopping the node at ' + url + ':' + port);
+                    listener.close();
+                });
+            }
         })
         .catch(function(error) {
             console.error('Failed to start the node at ' + node, error);
