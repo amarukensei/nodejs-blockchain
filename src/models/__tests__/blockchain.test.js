@@ -1,382 +1,426 @@
+const crypto = require('crypto');
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+
+// Use the real node-persist, but store the chains in a temporary directory
+const mockStorageRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'blockchain-test-'));
+jest.mock('node-persist', () => {
+  const nodePersist = jest.requireActual('node-persist');
+  const path = require('path');
+  return {
+    create: (options) => nodePersist.create({ ...options, dir: path.join(mockStorageRoot, path.basename(options.dir)) }),
+  };
+});
+jest.mock('../nodes');
+
 const Blockchain = require('../blockchain');
 const Block = require('../block');
-const Nodes = require('../nodes');
-const storage = require('node-persist');
-const sha256 = require('js-sha256');
+const Transaction = require('../transaction');
+const Transactions = require('../transactions');
+// A chain saved by the first version of the app (node-persist 3 and unsigned transactions)
+const legacyDatum = require('./fixtures/node-persist-3-blocks.json');
 
-// Mock dependencies
-jest.mock('../block');
-jest.mock('../nodes');
-jest.mock('js-sha256');
+const GENESIS_HASH = '00021b0673ecfef60a2e414ec216fcd57d4abb7314b30e35c7e13b205b84743e';
+const hashOf = (algorithm, data) => crypto.createHash(algorithm).update(data).digest('hex');
+const roundTrip = (value) => JSON.parse(JSON.stringify(value));
+const randomAddress = () => crypto.randomBytes(32).toString('hex');
 
-// Improved mock for node-persist
-const mockStorage = {
-  init: jest.fn().mockResolvedValue(undefined),
-  getItem: jest.fn().mockResolvedValue(undefined), // Default to resolve with undefined
-  setItem: jest.fn().mockResolvedValue(undefined),
-  clear: jest.fn().mockResolvedValue(undefined), // if used
-  // Add other methods if Blockchain uses them, e.g., length, key, etc.
-};
-jest.mock('node-persist', () => ({
-  create: jest.fn().mockReturnValue(mockStorage), // create() returns our mockStorage object
-  // Static methods like `რედაქტირება` or `რედაქტირებაSync` would be mocked here if used directly,
-  // but Blockchain seems to use an instance via create().config().
-}));
+const aliceKey = crypto.generateKeyPairSync('ed25519').privateKey;
+const malloryKey = crypto.generateKeyPairSync('ed25519').privateKey;
+const alice = Transaction.address(aliceKey);
+const mallory = Transaction.address(malloryKey);
 
-// Actual storage instance used by Blockchain class will be our mockStorage.
-// We can refer to `mockStorage.init`, `mockStorage.getItem` etc. in tests.
+// A payment of 1 from alice to a new address, so that no two transactions are the same
+const newTransaction = () => Transaction.sign(aliceKey, randomAddress(), 1);
+
+let lastPort = 0;
+const blockchains = [];
+
+// Every port gets its own storage directory, so tests don't share chains
+function newBlockchain(port = ++lastPort, minerAddress = alice) {
+  const blockchain = new Blockchain('test-host', port, minerAddress);
+  blockchains.push(blockchain);
+  return blockchain;
+}
+
+async function createBlockchain(port, minerAddress) {
+  const blockchain = newBlockchain(port, minerAddress);
+  await blockchain.init();
+  return blockchain;
+}
+
+function storageDirOf(blockchain) {
+  const dir = path.join(mockStorageRoot, path.basename(blockchain.storageDir));
+  fs.mkdirSync(dir, { recursive: true });
+  return dir;
+}
+
+// Mines blocks with a payment from alice in each of them, once she has coins
+function mineBlocks(blockchain, count) {
+  for (let i = 0; i < count; i++) {
+    const transactions = new Transactions();
+    if (blockchain.balanceOf(alice) > 0) {
+      transactions.list.push(newTransaction());
+    }
+    blockchain.mine(transactions, { status: jest.fn() });
+  }
+  return roundTrip(blockchain.blocks);
+}
+
+// A chain that shares its first `kept` blocks with `chain` and then has `count` blocks mined by mallory
+async function fork(chain, kept, count) {
+  const peer = await createBlockchain(++lastPort, mallory);
+  expect(peer.updateBlocks(roundTrip(chain.slice(0, kept)))).toBe(true);
+  return mineBlocks(peer, count);
+}
+
+// Redoes the proof of work from a block onwards, like an attacker rewriting the chain would
+function remine(blockchain, chain, fromIdx) {
+  for (let idx = fromIdx; idx < chain.length; idx++) {
+    if (idx > 0) chain[idx].previousHash = chain[idx - 1].hash;
+    chain[idx].nonce = 0;
+    chain[idx].hash = blockchain.generateHash(chain[idx]);
+  }
+  return chain;
+}
+
+afterEach(() => {
+  jest.restoreAllMocks();
+});
+
+afterAll(async () => {
+  // Wait for the writes node-persist still has queued before deleting their directory
+  await Promise.all(blockchains.map((blockchain) => blockchain.save()));
+  fs.rmSync(mockStorageRoot, { recursive: true, force: true });
+});
 
 describe('Blockchain', () => {
-  let blockchain; // Will hold Blockchain instance
-  let mockTransactions;
-  let mockRes;
+  describe('init()', () => {
+    test('creates and saves the genesis block, the same on every node, when nothing is stored', async () => {
+      const blockchain = await createBlockchain();
 
-  beforeEach(async () => { // Made beforeEach async to handle async blockchain instantiation
-    // Reset all general mocks
-    Block.mockClear();
-    Nodes.mockClear(); // Assuming Nodes has been mocked and its methods are jest.fn()
-    sha256.mockClear();
-
-    // Clear mocks on our mockStorage object
-    mockStorage.init.mockClear();
-    mockStorage.getItem.mockClear();
-    mockStorage.setItem.mockClear();
-    mockStorage.clear.mockClear();
-
-    // Set default behaviors for storage methods for each test
-    // (can be overridden in specific tests if needed)
-    mockStorage.getItem.mockImplementation(async (key) => {
-      if (key === 'blocks') return undefined; // Default: no blocks
-      if (key === 'transactions') return undefined; // Default: no pending transactions
-      return undefined;
-    });
-    
-    // Initialize blockchain here. Constructor calls async loadBlocks().
-    // The Blockchain constructor itself isn't async, but it triggers async operations.
-    blockchain = new Blockchain();
-    // Ensure async operations triggered by constructor (like loadBlocks) complete.
-    // Blockchain.js needs to expose a promise for this, or tests need to account for it.
-    // For now, we assume `loadBlocksPromise` or similar exists, or that subsequent awaits in tests handle it.
-    // If Blockchain class has a promise like `this.loadBlocksPromise = this.loadBlocks();`
-    // then we can do: await blockchain.loadBlocksPromise;
-    // Based on the original test, it seems `await blockchain.loadBlocks()` was called manually.
-    // Let's assume the constructor handles loadBlocks internally and we might need to wait if structure changed.
-    // If Blockchain constructor now internally awaits loadBlocks, then `new Blockchain()` might return a promise implicitly.
-    // However, standard JS constructors don't return promises.
-    // We will rely on the fact that storage calls are awaited inside Blockchain methods.
-
-    // Common mock objects
-    mockTransactions = {
-      list: [{ id: 'tx1' }],
-      reset: jest.fn(), // Assuming Transactions has a reset method
-    };
-    mockRes = {
-      status: jest.fn().mockReturnThis(),
-      json: jest.fn(),
-      send: jest.fn(), // Used by some methods
-    };
-  });
-
-  describe('constructor', () => {
-    test('Scenario 1: No existing blocks in storage', async () => {
-      // getItem is configured in beforeEach to return undefined for 'blocks' and 'transactions'
-      // Re-initialize blockchain to ensure constructor logic with these mocks is tested.
-      blockchain = new Blockchain();
-      // The constructor should call loadBlocks, which in turn might call addBlock for genesis.
-      // We need to await the completion of these async operations.
-      // A common pattern is for the class to expose a promise that resolves when init is done.
-      // If not, we might need a small delay or rely on internal awaits in Blockchain.
-      // For now, assume Blockchain's constructor internally handles this,
-      // and its methods correctly await storage operations.
-      
-      // Let's use a small delay to allow async operations in constructor to complete.
-      // This is not ideal, a dedicated promise from Blockchain would be better.
-      await new Promise(resolve => setTimeout(resolve, 0));
-
-
-      expect(mockStorage.init).toHaveBeenCalledTimes(1);
-      // getItem would be called for 'blocks' and 'transactions' by loadBlocks
-      expect(mockStorage.getItem).toHaveBeenCalledWith('blocks');
-      expect(mockStorage.getItem).toHaveBeenCalledWith('transactions');
-      
-      // A genesis block should be created if mockStorage.getItem('blocks') was undefined
-      expect(Block).toHaveBeenCalledTimes(1); // For the genesis block
       expect(blockchain.blocks).toHaveLength(1);
-      expect(blockchain.blocks[0]).toBeInstanceOf(Block);
-      // setItem is called by addBlock (which is called for genesis)
-      expect(mockStorage.setItem).toHaveBeenCalledWith('blocks', blockchain.blocks);
-      // setItem might also be called for transactions if they are initialized
-      // expect(mockStorage.setItem).toHaveBeenCalledWith('transactions', []);
-    });
-
-    test('Scenario 2: Existing blocks in storage', async () => {
-      const existingBlocksData = [
-        { index: 0, previousHash: '0', timestamp: Date.now(), transactions: [], nonce: 0, hash: 'hash0' },
-        { index: 1, previousHash: 'hash0', timestamp: Date.now(), transactions: [], nonce: 1, hash: 'hash1' },
-      ];
-      mockStorage.getItem.mockImplementation(async (key) => {
-        if (key === 'blocks') return existingBlocksData;
-        if (key === 'transactions') return []; // Or some existing transactions
-        return undefined;
+      expect(roundTrip(blockchain.blocks[0])).toEqual({
+        index: 0,
+        previousHash: '0000000000000000',
+        hash: GENESIS_HASH,
+        timestamp: 1790294400,
+        nonce: 10,
+        miner: null,
+        transactions: [],
       });
 
-      Block.mockClear(); // Clear any calls from previous tests or beforeEach setup
-
-      blockchain = new Blockchain(); // Re-initialize with the new mock for getItem
-      await new Promise(resolve => setTimeout(resolve, 0)); // Allow async loadBlocks to complete
-
-      expect(mockStorage.init).toHaveBeenCalledTimes(1);
-      expect(mockStorage.getItem).toHaveBeenCalledWith('blocks');
-      
-      expect(blockchain.blocks).toEqual(existingBlocksData); // Blocks should be loaded
-      expect(Block).not.toHaveBeenCalled(); // No NEW Block instances should be made if loaded from storage
-      // setItem should not be called for 'blocks' if they were just loaded and not changed
-      expect(mockStorage.setItem).not.toHaveBeenCalledWith('blocks', expect.any(Array));
-    });
-  });
-
-  describe('addBlock(block)', () => {
-    let mockBlockInstance;
-
-    beforeEach(() => {
-      // Create a fresh mock Block instance for each addBlock test
-      // This represents the block *to be added*
-      mockBlockInstance = new Block(); // This is a mock Block instance
-      mockBlockInstance.key = 'test-key'; // Mock key for hash generation
-      mockBlockInstance.nonce = 0;    // Mock nonce for hash generation
-      // Mock methods or properties on this specific instance if needed
-      // e.g., mockBlockInstance.addTransactions = jest.fn();
-
-      // Ensure blockchain.blocks is clean for specific scenarios
-      blockchain.blocks = [];
-      sha256.mockReturnValue('dummy-hash'); // Ensure generateHash works
+      await blockchain.save();
+      const reloaded = await createBlockchain(lastPort);
+      expect(reloaded.blocks).toEqual(roundTrip(blockchain.blocks));
     });
 
-    test('Scenario 1: Adding the first block (genesis)', async () => {
-      // The block passed to addBlock is assumed to be a new block, possibly genesis
-      // For genesis, previousHash and hash are set by addBlock.
-      
-      await blockchain.addBlock(mockBlockInstance);
+    test('loads the chain saved by a previous run, with its balances', async () => {
+      const blockchain = await createBlockchain();
+      const chain = mineBlocks(blockchain, 3);
+      await blockchain.save();
 
-      expect(mockBlockInstance.previousHash).toBe("0000000000000000");
-      // Verify hash generation was called
-      expect(sha256).toHaveBeenCalled(); // generateHash was called
-      expect(mockBlockInstance.hash).toBe('dummy-hash'); // generateHash assigned the hash
-      expect(blockchain.blocks).toHaveLength(1);
-      expect(blockchain.blocks[0]).toBe(mockBlockInstance);
-      expect(mockStorage.setItem).toHaveBeenCalledWith('blocks', blockchain.blocks);
+      const reloaded = await createBlockchain(lastPort);
+
+      expect(reloaded.blocks).toEqual(chain);
+      expect(reloaded.balanceOf(alice)).toBe(3 * 50 - 2);
+      expect(reloaded.hasTransaction(chain[2].transactions[0])).toBe(true);
     });
 
-    test('Scenario 2: Adding a subsequent block', async () => {
-      const previousBlock = new Block(); // Mock existing block
-      previousBlock.hash = 'previous-block-hash';
-      blockchain.blocks = [previousBlock]; // Setup existing chain
-      
-      await blockchain.addBlock(mockBlockInstance);
+    test('finds chains saved with node-persist 3, which named files after the MD5 of the key', async () => {
+      const chain = mineBlocks(await createBlockchain(), 2);
+      const blockchain = newBlockchain();
+      fs.writeFileSync(path.join(storageDirOf(blockchain), hashOf('md5', 'blocks')), JSON.stringify({ key: 'blocks', value: chain }));
 
-      expect(mockBlockInstance.previousHash).toBe(previousBlock.hash);
-      expect(sha256).toHaveBeenCalled(); 
-      expect(mockBlockInstance.hash).toBe('dummy-hash');
-      expect(blockchain.blocks).toHaveLength(2);
-      expect(blockchain.blocks[1]).toBe(mockBlockInstance);
-      expect(mockStorage.setItem).toHaveBeenCalledWith('blocks', blockchain.blocks);
-    });
-  });
+      await blockchain.init();
 
-  describe('getNextBlock(transactions)', () => {
-    let mockPreviousBlock;
-    let mockNewBlockInstance;
-
-    beforeEach(() => {
-      mockPreviousBlock = new Block(); // Mock instance of Block
-      mockPreviousBlock.index = 0;
-      mockPreviousBlock.hash = 'prev-hash';
-      
-      // Mock getPreviousBlock to return our controlled block
-      blockchain.getPreviousBlock = jest.fn().mockReturnValue(mockPreviousBlock);
-
-      // Mock generateHash to return a predictable hash
-      blockchain.generateHash = jest.fn().mockReturnValue('next-block-hash');
-      
-      // When `new Block(...)` is called inside getNextBlock, it should return our mock instance
-      mockNewBlockInstance = new Block(); // This is the block getNextBlock will "create"
-      mockNewBlockInstance.addTransactions = jest.fn(); // Mock its methods
-      Block.mockImplementation(() => mockNewBlockInstance);
-
-
+      expect(blockchain.blocks).toEqual(chain);
     });
 
-    test('should create and return a new block with correct properties', () => {
-      const resultBlock = blockchain.getNextBlock(mockTransactions);
+    test('refuses to load a chain created by the first version, with unsigned transactions', async () => {
+      const blockchain = newBlockchain();
+      fs.writeFileSync(path.join(storageDirOf(blockchain), hashOf('md5', 'blocks')), JSON.stringify(legacyDatum));
 
-      expect(Block).toHaveBeenCalledTimes(1); // A new Block was instantiated
-      // Check constructor arguments for the new block if necessary, e.g.
-      // expect(Block).toHaveBeenCalledWith(expect.any(Number), mockPreviousBlock.hash, ???); 
-      // This depends on how Block is constructed and what getNextBlock passes.
-      // Based on typical blockchain logic:
-      // new Block(timestamp, previousHash, transactions (handled by addTransactions), nonce, hash)
-      // Nonce and hash are set by generateHash.
-      // The actual Block constructor in the code takes: timestamp, previousHash, transactions (raw), nonce, hash
-
-      expect(resultBlock).toBe(mockNewBlockInstance); // Returns the created mock instance
-      expect(resultBlock.addTransactions).toHaveBeenCalledWith(mockTransactions);
-      expect(resultBlock.index).toBe(mockPreviousBlock.index + 1);
-      expect(resultBlock.previousHash).toBe(mockPreviousBlock.hash);
-      expect(blockchain.generateHash).toHaveBeenCalledWith(resultBlock);
-      expect(resultBlock.hash).toBe('next-block-hash');
-    });
-  });
-
-  describe('getPreviousBlock()', () => {
-    test('should return the last block in the chain', () => {
-      const block1 = { index: 0 };
-      const block2 = { index: 1 };
-      blockchain.blocks = [block1, block2];
-      expect(blockchain.getPreviousBlock()).toBe(block2);
+      await expect(blockchain.init()).rejects.toThrow('is not valid');
     });
 
-    test('should return undefined if chain is empty (though constructor adds genesis)', () => {
-      blockchain.blocks = []; // Force empty
-      expect(blockchain.getPreviousBlock()).toBeUndefined();
+    test('refuses to load a stored chain that is not valid', async () => {
+      const tampered = mineBlocks(await createBlockchain(), 2);
+      tampered[1].miner = mallory;
+      const blockchain = newBlockchain();
+      fs.writeFileSync(path.join(storageDirOf(blockchain), hashOf('sha256', 'blocks')), JSON.stringify({ key: 'blocks', value: tampered }));
+
+      await expect(blockchain.init()).rejects.toThrow('is not valid');
     });
   });
 
   describe('generateHash(block)', () => {
-    let mockBlockForKey;
+    test('finds a nonce whose hash meets the difficulty and matches the block key', async () => {
+      const blockchain = await createBlockchain();
+      const block = new Block();
+      block.index = 1;
+      block.previousHash = GENESIS_HASH;
+      block.miner = alice;
+      block.transactions = [newTransaction()];
 
-    beforeEach(() => {
-      mockBlockForKey = { // Not a Block instance, just an object with key and nonce
-        key: 'test_data_for_hashing',
-        nonce: 0,
-      };
-      // Reset sha256 mock for specific call counting per test
-      sha256.mockClear();
-    });
+      const hash = blockchain.generateHash(block);
 
-    test('should call js-sha256 until hash starts with "000"', () => {
-      sha256
-        .mockReturnValueOnce('123hash')
-        .mockReturnValueOnce('012hash')
-        .mockReturnValueOnce('000hash_success');
-
-      const hash = blockchain.generateHash(mockBlockForKey);
-
-      expect(sha256).toHaveBeenCalledTimes(3);
-      expect(sha256).toHaveBeenNthCalledWith(1, mockBlockForKey.key + 0);
-      expect(sha256).toHaveBeenNthCalledWith(2, mockBlockForKey.key + 1);
-      expect(sha256).toHaveBeenNthCalledWith(3, mockBlockForKey.key + 2);
-      expect(mockBlockForKey.nonce).toBe(2); // Nonce incremented until success
-      expect(hash).toBe('000hash_success');
-    });
-
-    test('should handle block without a key property gracefully (or throw error)', () => {
-        // Based on current implementation, it would be `undefined + nonce` leading to `NaN` in string context
-        // then sha256 would hash "NaN0", "NaN1" etc. This is probably not intended.
-        // For now, let's test current behavior.
-        const blockWithoutKey = { nonce: 0 };
-        sha256.mockReturnValueOnce('000_hash_for_nan');
-        
-        const hash = blockchain.generateHash(blockWithoutKey);
-        
-        expect(sha256).toHaveBeenCalledWith('undefined0'); // Or "NaN0" depending on JS coercion
-        expect(blockWithoutKey.nonce).toBe(0);
-        expect(hash).toBe('000_hash_for_nan');
+      expect(hash.startsWith('000')).toBe(true);
+      expect(hash).toBe(hashOf('sha256', block.key));
+      expect(blockchain.calculateHash(roundTrip(block))).toBe(hash);
     });
   });
 
   describe('mine(transactions, res)', () => {
-    let mockNewBlock;
+    test('mines the pending transactions and the reward for the miner into a new block and broadcasts it', async () => {
+      const blockchain = await createBlockchain();
+      mineBlocks(blockchain, 1);
+      const transactions = new Transactions();
+      const tx = newTransaction();
+      transactions.list.push(tx);
+      const mockRes = { status: jest.fn() };
 
-    beforeEach(() => {
-      mockNewBlock = new Block(); // A mock block that getNextBlock will return
-      mockNewBlock.hash = 'mined-block-hash'; // Give it some identifiable property
+      const block = blockchain.mine(transactions, mockRes);
 
-      blockchain.getNextBlock = jest.fn().mockReturnValue(mockNewBlock);
-      blockchain.addBlock = jest.fn().mockResolvedValue(undefined); // Simulate async addBlock
-
-      // Mock Nodes instance and its broadcast method
-      // blockchain.nodes is an instance of the mocked Nodes class.
-      // So we need to ensure its broadcast method is a mock.
-      // The Nodes mock should handle this if its methods are jest.fn()
-      // If blockchain.nodes was instantiated with `new Nodes()`, and Nodes is jest.mocked:
-      // then blockchain.nodes.broadcast should already be a jest.fn().
-      // Let's verify by ensuring Nodes.mock.instances[0].broadcast exists if an instance was made.
-      if (Nodes.mock.instances.length > 0) {
-        Nodes.mock.instances[0].broadcast = jest.fn();
-        blockchain.nodes = Nodes.mock.instances[0]; // ensure our blockchain uses this instance
-      } else {
-        // If constructor didn't make one, create a manual one for the test
-        const mockNodesInstance = new Nodes();
-        mockNodesInstance.broadcast = jest.fn();
-        blockchain.nodes = mockNodesInstance;
-      }
-    });
-
-    test('Success case: should mine block and broadcast', async () => {
-      mockTransactions.list = [{ id: 'tx1' }]; // Ensure transactions exist
-
-      const result = await blockchain.mine(mockTransactions, mockRes);
-
-      expect(blockchain.getNextBlock).toHaveBeenCalledWith(mockTransactions);
-      expect(blockchain.addBlock).toHaveBeenCalledWith(mockNewBlock);
-      expect(blockchain.nodes.broadcast).toHaveBeenCalledTimes(1);
-      expect(result).toBe(mockNewBlock);
+      expect(block).toMatchObject({ index: 2, previousHash: blockchain.blocks[1].hash, miner: alice });
+      expect(block.transactions).toEqual([tx]);
+      expect(transactions.list).toEqual([]);
+      expect(blockchain.blocks).toHaveLength(3);
+      expect(blockchain.balanceOf(alice)).toBe(50 - 1 + 50);
+      expect(blockchain.balanceOf(tx.to)).toBe(1);
+      expect(blockchain.hasTransaction(roundTrip(tx))).toBe(true);
+      expect(blockchain.validateChain(roundTrip(blockchain.blocks))).not.toBeNull();
+      expect(blockchain.nodes.broadcast).toHaveBeenCalledTimes(2);
       expect(mockRes.status).not.toHaveBeenCalled();
-      expect(mockRes.json).not.toHaveBeenCalled(); // Or check for specific success response if any
     });
 
-    test('Failure case: no transactions to be mined', async () => {
-      mockTransactions.list = []; // No transactions
+    test('mines a block with just the reward when there are no pending transactions', async () => {
+      const blockchain = await createBlockchain();
 
-      const result = await blockchain.mine(mockTransactions, mockRes);
+      const block = blockchain.mine(new Transactions(), { status: jest.fn() });
 
-      expect(mockRes.status).toHaveBeenCalledWith(500);
-      // The actual implementation sends {error: ...} via res.send, not res.json
-      // And it doesn't return the error object from the function itself, but undefined.
-      // Let's adjust based on the actual code's behavior for mine:
-      // It calls `res.send({error: ...})` and returns nothing in case of error.
-      // If successful, it returns the block.
+      expect(block).toMatchObject({ index: 1, previousHash: GENESIS_HASH, miner: alice, transactions: [] });
+      expect(blockchain.balanceOf(alice)).toBe(50);
+    });
 
-      // The original code does: `return res.status(500).send({error: ...})`
-      // which means the function would return the result of `res.send(...)`
-      // Let's assume `res.send` returns `res` for chaining or `undefined`.
-      // For testing, we care that `res.send` was called with the error.
-      expect(mockRes.send).toHaveBeenCalledWith({ error: 'No transactions to be mined' });
+    test('does not mine without an address for the rewards', async () => {
+      const blockchain = await createBlockchain(++lastPort, null);
+      const mockRes = { status: jest.fn() };
 
-      // The function should effectively return undefined or what res.send returns
-      // If it returns the res object: expect(result).toBe(mockRes);
-      // If it returns what res.send returns (e.g. undefined): expect(result).toBeUndefined();
-      // Given `return res.status(500).send(...)`, it returns the result of `send`.
-      // We'll assume `send` returns `res` for now. If not, the test for `result` might need adjustment.
-      // Let's check if `res.send` was called, which is more robust.
+      const result = blockchain.mine(new Transactions(), mockRes);
 
-      expect(blockchain.getNextBlock).not.toHaveBeenCalled();
-      expect(blockchain.addBlock).not.toHaveBeenCalled();
+      expect(result).toEqual({ error: 'This node does not mine, as MINER_ADDRESS is not set' });
+      expect(mockRes.status).toHaveBeenCalledWith(503);
+      expect(blockchain.blocks).toHaveLength(1);
       expect(blockchain.nodes.broadcast).not.toHaveBeenCalled();
     });
-  });
 
-  describe('updateBlocks(blocks, transactions)', () => { // Added transactions based on impl.
-    test('should replace this.blocks and this.transactions, and save blocks', async () => {
-      const newBlocksArray = [{ index: 0, hash: 'new_genesis' }];
-      const newTransactionsArray = [{id: 'new_tx'}];
-      
-      // Mock blockchain's current transactions if the method also updates them
-      blockchain.transactions = { list: [], reset: jest.fn() };
+    test('leaves out pending transactions that another node already added to the chain', async () => {
+      const peer = await createBlockchain();
+      const minedByPeer = mineBlocks(peer, 2)[2].transactions[0];
+      const blockchain = await createBlockchain();
+      blockchain.updateBlocks(roundTrip(peer.blocks));
+      const transactions = new Transactions();
+      const pending = newTransaction();
+      transactions.list.push(new Transaction(minedByPeer.from, minedByPeer.to, minedByPeer.amount, minedByPeer.timestamp, minedByPeer.signature), pending);
 
+      const block = blockchain.mine(transactions, { status: jest.fn() });
 
-      await blockchain.updateBlocks(newBlocksArray, newTransactionsArray);
+      expect(block.transactions).toEqual([pending]);
+      expect(blockchain.validateChain(roundTrip(blockchain.blocks))).not.toBeNull();
+    });
 
-      expect(blockchain.blocks).toBe(newBlocksArray);
-      expect(blockchain.transactions.list).toBe(newTransactionsArray); 
+    test('leaves out pending transactions whose sender does not have the balance anymore', async () => {
+      const blockchain = await createBlockchain();
+      mineBlocks(blockchain, 1);
+      const transactions = new Transactions();
+      const affordable = Transaction.sign(aliceKey, randomAddress(), 30);
+      transactions.list.push(affordable, Transaction.sign(aliceKey, randomAddress(), 30));
 
-      expect(mockStorage.setItem).toHaveBeenCalledWith('blocks', newBlocksArray);
-      expect(mockStorage.setItem).toHaveBeenCalledWith('transactions', newTransactionsArray);
+      const block = blockchain.mine(transactions, { status: jest.fn() });
+
+      expect(block.transactions).toEqual([affordable]);
+      expect(blockchain.balanceOf(alice)).toBe(50 - 30 + 50);
     });
   });
-  
+
+  describe('hasTransaction(tx)', () => {
+    test('tells whether the chain has the same transaction, whatever object holds it', async () => {
+      const blockchain = await createBlockchain();
+      const chain = mineBlocks(blockchain, 2);
+
+      expect(blockchain.hasTransaction({ ...chain[2].transactions[0] })).toBe(true);
+      expect(blockchain.hasTransaction(newTransaction())).toBe(false);
+    });
+  });
+
+  describe('validateChain(blocks, knownBlocks)', () => {
+    let blockchain;
+    let chain;
+
+    beforeAll(async () => {
+      blockchain = await createBlockchain();
+      chain = mineBlocks(blockchain, 4);
+    });
+
+    test('returns the ledger of a chain built by this node', () => {
+      const ledger = blockchain.validateChain(chain);
+
+      expect(ledger.balanceOf(alice)).toBe(blockchain.balanceOf(alice));
+      expect(ledger.has(chain[3].transactions[0])).toBe(true);
+    });
+
+    test('rejects a chain created by the first version, with unsigned transactions', () => {
+      expect(blockchain.validateChain(legacyDatum.value)).toBeNull();
+    });
+
+    test.each([
+      ['is not an array', () => ({ length: 99 })],
+      ['is empty', () => []],
+      ['contains something that is not a block', (c) => { c[2] = null; return c; }],
+      ['has a tampered transaction', (c) => { c[2].transactions[0].amount = 2; return c; }],
+      ['has a tampered timestamp', (c) => { c[2].timestamp++; return c; }],
+      ['has a tampered miner', (c) => { c[2].miner = mallory; return c; }],
+      ['has a tampered hash', (c) => { c[2].hash = '000' + 'f'.repeat(61); return c; }],
+      ['has a broken link', (c) => { c[3].previousHash = c[1].hash; return c; }],
+      ['has blocks out of order', (c) => [c[0], c[2], c[1], c[3], c[4]]],
+      ['has a block with an unexpected field', (c) => { c[2].evil = 'x'; return c; }],
+      ['has a block with an invalid timestamp', (c) => { c[2].timestamp = 'yesterday'; return c; }],
+    ])('rejects a chain that %s', (description, tamper) => {
+      expect(blockchain.validateChain(tamper(roundTrip(chain)))).toBeNull();
+    });
+
+    test.each([
+      ['a transaction whose recipient was changed', (c) => { c[2].transactions[0].to = mallory; }],
+      ['a transaction from alice signed by mallory', (c) => {
+        c[4].transactions.push({ ...roundTrip(Transaction.sign(malloryKey, mallory, 10)), from: alice });
+      }],
+      ['a transaction that spends more than its sender has', (c) => {
+        c[4].transactions.push(roundTrip(Transaction.sign(malloryKey, randomAddress(), 1000)));
+      }],
+      ['the same transaction twice', (c) => { c[4].transactions.push(c[2].transactions[0]); }],
+      ['a block without miner', (c) => { c[3].miner = null; }],
+      ['a miner that is not an address', (c) => { c[3].miner = 'mallory'; }],
+    ])('rejects %s even when the proof of work is redone', (description, tamper) => {
+      const tampered = roundTrip(chain);
+      tamper(tampered);
+
+      expect(blockchain.validateChain(remine(blockchain, tampered, 1))).toBeNull();
+    });
+
+    test.each([
+      ['transactions', (c) => { c[0].transactions = [roundTrip(Transaction.sign(malloryKey, mallory, 1000))]; }],
+      ['a miner', (c) => { c[0].miner = mallory; }],
+    ])('rejects a genesis block with %s even when the proof of work is redone', (description, tamper) => {
+      const tampered = roundTrip(chain);
+      tamper(tampered);
+
+      expect(blockchain.validateChain(remine(blockchain, tampered, 0))).toBeNull();
+    });
+
+    test('rejects hashes that do not meet the difficulty', () => {
+      const tampered = roundTrip(chain);
+      do {
+        tampered[4].nonce++;
+        tampered[4].hash = blockchain.calculateHash(tampered[4]);
+      } while (tampered[4].hash.startsWith('000'));
+
+      expect(blockchain.validateChain(tampered)).toBeNull();
+    });
+
+    test('only verifies the signatures of the blocks that are not known', async () => {
+      const local = await createBlockchain();
+      const knownBlocks = mineBlocks(local, 3);
+      const longerChain = mineBlocks(local, 1);
+      const isValid = jest.spyOn(Transaction, 'isValid');
+
+      expect(local.validateChain(longerChain, knownBlocks)).not.toBeNull();
+      expect(isValid).toHaveBeenCalledTimes(1);
+      expect(isValid).toHaveBeenCalledWith(longerChain[4].transactions[0]);
+
+      // Known blocks still need the right content for their hash
+      const tampered = roundTrip(longerChain);
+      tampered[2].transactions[0].amount = 2;
+      expect(local.validateChain(tampered, knownBlocks)).toBeNull();
+    });
+
+    test('verifies the signatures of the blocks that replace known ones', async () => {
+      const local = await createBlockchain();
+      const knownBlocks = mineBlocks(local, 3);
+      // A longer fork where mallory changed the recipient of a known transaction
+      const tampered = roundTrip(knownBlocks);
+      tampered[2].transactions[0].to = mallory;
+      tampered.push({ index: 4, previousHash: '', hash: '', timestamp: 1, nonce: 0, miner: mallory, transactions: [] });
+
+      expect(local.validateChain(remine(local, tampered, 1), knownBlocks)).toBeNull();
+    });
+  });
+
+  describe('updateBlocks(blocks)', () => {
+    test('replaces the chain with a valid one from another node and saves it', async () => {
+      const port = ++lastPort;
+      const blockchain = await createBlockchain(port);
+      const peerChain = mineBlocks(await createBlockchain(), 3);
+
+      expect(blockchain.updateBlocks(peerChain)).toBe(true);
+      expect(blockchain.blocks).toEqual(peerChain);
+      expect(blockchain.hasTransaction(peerChain[2].transactions[0])).toBe(true);
+      expect(blockchain.balanceOf(alice)).toBe(3 * 50 - 2);
+
+      await blockchain.save();
+      expect((await createBlockchain(port)).blocks).toEqual(peerChain);
+    });
+
+    test('keeps the current chain when the new one is not valid', async () => {
+      const blockchain = await createBlockchain();
+      const current = roundTrip(blockchain.blocks);
+      const peerChain = mineBlocks(await createBlockchain(), 3);
+      peerChain[3].transactions[0].to = mallory;
+
+      expect(blockchain.updateBlocks(peerChain)).toBe(false);
+      expect(blockchain.updateBlocks({ length: 99 })).toBe(false);
+      expect(roundTrip(blockchain.blocks)).toEqual(current);
+      expect(blockchain.hasTransaction(peerChain[2].transactions[0])).toBe(false);
+      expect(blockchain.balanceOf(alice)).toBe(0);
+    });
+
+    test('keeps the current chain when the new one starts with another genesis block', async () => {
+      const blockchain = await createBlockchain();
+      const peerChain = mineBlocks(await createBlockchain(), 2);
+      // Another nonce that also meets the difficulty gives a different, valid, genesis block
+      do {
+        peerChain[0].nonce++;
+      } while (!blockchain.calculateHash(peerChain[0]).startsWith('000'));
+      peerChain[0].hash = blockchain.calculateHash(peerChain[0]);
+      remine(blockchain, peerChain, 1);
+
+      expect(blockchain.validateChain(peerChain)).not.toBeNull();
+      expect(blockchain.updateBlocks(peerChain)).toBe(false);
+      expect(blockchain.blocks).toHaveLength(1);
+    });
+
+    test('lets a longer chain replace up to its last 10 blocks, but no more', async () => {
+      const blockchain = await createBlockchain();
+      const chain = mineBlocks(blockchain, 12);
+
+      // Replaces blocks 3 to 12
+      const shallowFork = await fork(chain, 3, 11);
+      // Replaces blocks 2 to 12
+      const deepFork = await fork(chain, 2, 12);
+
+      expect(blockchain.updateBlocks(deepFork)).toBe(false);
+      expect(blockchain.blocks).toEqual(chain);
+      expect(blockchain.updateBlocks(shallowFork)).toBe(true);
+      expect(blockchain.blocks).toEqual(shallowFork);
+    });
+  });
+
   describe('getBlockByIndex(idx)', () => {
-    beforeEach(() => {
+    let blockchain;
+
+    beforeEach(async () => {
+      blockchain = await createBlockchain();
       blockchain.blocks = [
         { index: 0, data: 'genesis' },
         { index: 1, data: 'block1' },
@@ -389,24 +433,27 @@ describe('Blockchain', () => {
     });
 
     test('should return empty array for an index too high', () => {
-      expect(blockchain.getBlockByIndex(5)).toEqual([]); // As per current code snippet
+      expect(blockchain.getBlockByIndex(5)).toEqual([]);
     });
 
     test('should return empty array for a negative index', () => {
-      expect(blockchain.getBlockByIndex(-1)).toEqual([]); // As per current code snippet
+      expect(blockchain.getBlockByIndex(-1)).toEqual([]);
     });
-     test('should return empty array for non-numeric index', () => {
-      expect(blockchain.getBlockByIndex("abc")).toEqual([]);
+
+    test('should return empty array for non-numeric index', () => {
+      expect(blockchain.getBlockByIndex('abc')).toEqual([]);
     });
   });
 
   describe('getBlockLastIndex()', () => {
-    test('should return the last index when blocks exist', () => {
+    test('should return the last index when blocks exist', async () => {
+      const blockchain = await createBlockchain();
       blockchain.blocks = [{ index: 0 }, { index: 1 }, { index: 2 }];
       expect(blockchain.getBlockLastIndex()).toBe(2);
     });
 
-    test('should return -1 when no blocks exist', () => {
+    test('should return -1 when no blocks exist', async () => {
+      const blockchain = await createBlockchain();
       blockchain.blocks = [];
       expect(blockchain.getBlockLastIndex()).toBe(-1);
     });

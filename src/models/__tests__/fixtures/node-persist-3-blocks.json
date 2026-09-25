@@ -1,0 +1,43 @@
+{
+    "key": "blocks",
+    "value": [
+        {
+            "index": 0,
+            "previousHash": "0000000000000000",
+            "hash": "00002818703517bab21046d807a3fc0284b8a05979ce48baa40ed2eeeadd3b92",
+            "timestamp": 1790306367,
+            "nonce": 4190,
+            "transactions": []
+        },
+        {
+            "index": 1,
+            "previousHash": "00002818703517bab21046d807a3fc0284b8a05979ce48baa40ed2eeeadd3b92",
+            "hash": "0000d0360e4187e4572f9fd134fc36e43c7f0a35d746a694d4dd7b6cbfdbe433",
+            "timestamp": 1790306369,
+            "nonce": 8434,
+            "transactions": [
+                {
+                    "from": "bd748a5a5479649cfd83132d3be99d0c1a2ebadc1e4c405e",
+                    "to": "3be24b8dccf3c0a171c76b092e2a95f6e9d387eac6b647f1",
+                    "amount": 1,
+                    "timestamp": 1790306369
+                }
+            ]
+        },
+        {
+            "index": 2,
+            "previousHash": "0000d0360e4187e4572f9fd134fc36e43c7f0a35d746a694d4dd7b6cbfdbe433",
+            "hash": "0002b30f6b73b9a517a9813c592394e4a0782849ec0bc772c7434f4e38f5887b",
+            "timestamp": 1790306369,
+            "nonce": 1184,
+            "transactions": [
+                {
+                    "from": "alice",
+                    "to": "bob — café ✓",
+                    "amount": 2.5,
+                    "timestamp": 1790306369
+                }
+            ]
+        }
+    ]
+}
