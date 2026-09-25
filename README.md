@@ -368,7 +368,7 @@ Version 2.0 changed how blocks and transactions are made (transactions are signe
 
 ## Author
 
-Bernardino Todolí López - [Taula Consulting](http://www.taula-consulting.com/en/)
+Bernardino Todolí López - [btodoli.net](https://btodoli.net)
 
 ## License
 
