@@ -70,6 +70,28 @@ describe('Transactions', () => {
         expect(mockRes.status).toHaveBeenCalledWith(406);
         expect(mockRes.json).toHaveBeenCalledWith({ error: errorMessage });
       });
+
+      test('should validate an empty transaction when the request has no JSON body', () => {
+        mockReq.body = undefined; // Express 5 leaves req.body undefined without a JSON body
+
+        transactions.add(mockReq, mockRes);
+
+        expect(Transaction).toHaveBeenCalledWith(undefined, undefined, undefined);
+      });
+    });
+
+    describe('Failure case (too many pending transactions)', () => {
+      test('should reject the transaction with status 503 once 1000 are pending', () => {
+        transactions.list = new Array(1000).fill({ id: 'tx' });
+        mockReq.body = { from: 'address1', to: 'address2', amount: 100 };
+
+        transactions.add(mockReq, mockRes);
+
+        expect(Transaction).not.toHaveBeenCalled();
+        expect(transactions.list).toHaveLength(1000);
+        expect(mockRes.status).toHaveBeenCalledWith(503);
+        expect(mockRes.json).toHaveBeenCalledWith({ error: 'Too many pending transactions, mine them before adding more' });
+      });
     });
   });
 

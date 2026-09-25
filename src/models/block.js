@@ -9,7 +9,13 @@ class Block {
     }
 
     get key() {
-        return JSON.stringify(this.transactions) + this.index + this.previousHash + this.nonce;
+        return Block.keyPrefix(this) + this.nonce;
+    }
+
+    // Everything the hash of a block covers except the nonce. Static so it also works
+    // with plain objects, like blocks read from disk or received from other nodes.
+    static keyPrefix(block) {
+        return JSON.stringify(block.transactions) + block.index + block.previousHash;
     }
 
     addTransactions(transactions) {

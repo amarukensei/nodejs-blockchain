@@ -9,8 +9,12 @@ class BlockchainController {
         this.transactions = new Transactions();
     }
 
+    init() {
+        return this.blockchain.init();
+    }
+
     resolve(req, res) {
-        this.nodes.resolve(res, this.blockchain);
+        return this.nodes.resolve(res, this.blockchain);
     }
 
     getNodes(req, res) {
